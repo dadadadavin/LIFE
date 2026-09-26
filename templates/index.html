@@ -1,0 +1,699 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lifel — Gemini 3.8 Live Workbench (Go + HTMX)</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+  <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+  <style type="text/tailwindcss">
+    @theme {
+      --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      --color-paper: #f9f9f7;
+      --color-ink: #1a1a19;
+      --color-muted: #666660;
+      --color-line: #e4e4df;
+      --color-pastel-blue: #e8f0f8;
+      --color-pastel-green: #e6f3ec;
+      --color-pastel-rose: #fae8e6;
+      --color-pastel-lavender: #f0ecf8;
+      --color-pastel-sand: #f4f1ea;
+    }
+    body {
+      background-color: #f9f9f7;
+      color: #1a1a19;
+      font-family: var(--font-sans);
+      -webkit-font-smoothing: antialiased;
+    }
+  </style>
+</head>
+<body class="h-screen flex overflow-hidden text-[13.5px] bg-[#f9f9f7] text-[#1a1a19]">
+
+  <!-- Left Sidebar -->
+  <aside class="w-56 shrink-0 bg-white border-r border-[#e4e4df] flex flex-col justify-between select-none">
+    <div>
+      <div class="px-5 py-4 border-b border-[#e4e4df]">
+        <div class="text-[15px] font-semibold tracking-tight text-[#1a1a19]">Lifel</div>
+        <div class="text-[11.5px] text-[#666660] mt-0.5">Go · HTMX · Gemini 3.8 Live</div>
+      </div>
+
+      <nav class="p-2.5 flex flex-col gap-1" id="sidebar-nav">
+        <button type="button" data-tab="studio"
+          class="nav-tab text-left px-3 py-2 rounded text-[13px] font-medium bg-[#e8f0f8] text-[#1a1a19] cursor-pointer transition-colors">
+          Live Studio
+        </button>
+        <button type="button" data-tab="config"
+          class="nav-tab text-left px-3 py-2 rounded text-[13px] text-[#555550] hover:bg-[#f4f4f0] cursor-pointer transition-colors">
+          Configuration
+        </button>
+        <button type="button" data-tab="voice"
+          class="nav-tab text-left px-3 py-2 rounded text-[13px] text-[#555550] hover:bg-[#f4f4f0] cursor-pointer transition-colors">
+          Voice &amp; Audio
+        </button>
+        <button type="button" data-tab="memory"
+          class="nav-tab text-left px-3 py-2 rounded text-[13px] text-[#555550] hover:bg-[#f4f4f0] cursor-pointer transition-colors">
+          Memory Bank
+        </button>
+        <button type="button" data-tab="tools"
+          class="nav-tab text-left px-3 py-2 rounded text-[13px] text-[#555550] hover:bg-[#f4f4f0] cursor-pointer transition-colors">
+          Tools
+        </button>
+        <button type="button" data-tab="sessions"
+          class="nav-tab text-left px-3 py-2 rounded text-[13px] text-[#555550] hover:bg-[#f4f4f0] cursor-pointer transition-colors">
+          Session History
+        </button>
+        <button type="button" data-tab="keys"
+          class="nav-tab text-left px-3 py-2 rounded text-[13px] text-[#555550] hover:bg-[#f4f4f0] cursor-pointer transition-colors">
+          API Keys
+        </button>
+      </nav>
+    </div>
+
+    <div class="p-4 border-t border-[#e4e4df] bg-[#f9f9f7] flex flex-col gap-1.5 text-[11.5px]">
+      <div class="flex items-center justify-between">
+        <span class="text-[#666660]">Status</span>
+        <span id="sidebar-conn-badge" class="px-2 py-0.5 rounded bg-[#f4f4f0] border border-[#e4e4df] text-[#555550] font-medium">Offline</span>
+      </div>
+      <div class="flex items-center justify-between">
+        <span class="text-[#666660]">Voice</span>
+        <span id="sidebar-voice-label" class="font-mono text-[#1a1a19]">{{.Config.VoiceName}}</span>
+      </div>
+      <div class="flex items-center justify-between">
+        <span class="text-[#666660]">Key Mode</span>
+        <span id="sidebar-key-label" class="font-mono text-[#1a1a19]">{{.Config.SelectedKey}}</span>
+      </div>
+      <div class="pt-1 text-[11px] text-[#777770]">
+        Shortcuts: <kbd class="px-1 py-0.5 bg-white border border-[#d4d4ce] rounded font-mono">Space</kbd> Interrupt · <kbd class="px-1 py-0.5 bg-white border border-[#d4d4ce] rounded font-mono">M</kbd> Mute
+      </div>
+    </div>
+  </aside>
+
+  <!-- Main Workspace -->
+  <div class="flex-1 flex flex-col min-w-0 overflow-hidden">
+
+    <!-- Top Header Bar -->
+    <header class="h-14 shrink-0 bg-white border-b border-[#e4e4df] px-6 flex items-center justify-between gap-4">
+      <div class="flex items-center gap-3 min-w-0">
+        <h1 id="topbar-title" class="text-[15px] font-semibold text-[#1a1a19] truncate">Live Studio</h1>
+        <span id="live-status-text" class="text-[12px] text-[#666660] truncate">Ready to connect ({{.Config.Model}})</span>
+      </div>
+
+      <div class="flex items-center gap-2.5 shrink-0">
+        <!-- Quick Response Style Selector -->
+        <form hx-post="/htmx/config" hx-swap="none" class="flex items-center gap-1.5 text-[12px]">
+          <label for="quick-style-select" class="text-[#666660]">Style:</label>
+          <select id="quick-style-select" name="response_style" onchange="this.form.requestSubmit()"
+            class="px-2 py-1 rounded border border-[#d4d4ce] bg-[#f9f9f7] text-[#1a1a19] text-[12px] cursor-pointer">
+            <option value="concise" {{if eq .Config.ResponseStyle "concise"}}selected{{end}}>Concise</option>
+            <option value="balanced" {{if eq .Config.ResponseStyle "balanced"}}selected{{end}}>Balanced</option>
+            <option value="detailed" {{if eq .Config.ResponseStyle "detailed"}}selected{{end}}>Detailed</option>
+          </select>
+        </form>
+
+        <button type="button" id="btn-interrupt" disabled
+          class="px-2.5 py-1.5 rounded border border-[#d4d4ce] bg-white hover:bg-[#f4f4f0] text-[#1a1a19] text-[12px] disabled:opacity-40 cursor-pointer"
+          title="Cut off Gemini audio immediately (Shortcut: Space)">
+          Interrupt
+        </button>
+
+        <button type="button" id="btn-connect"
+          class="px-4 py-1.5 rounded bg-[#1a1a19] hover:bg-[#333330] text-white font-medium text-[12.5px] cursor-pointer transition-colors">
+          Start Live Session
+        </button>
+      </div>
+    </header>
+
+    <!-- Tab Panels Container -->
+    <main class="flex-1 overflow-y-auto p-6">
+
+      <!-- ================================================================= -->
+      <!-- TAB 1: LIVE STUDIO                                                -->
+      <!-- ================================================================= -->
+      <section id="tab-studio" class="tab-panel h-full flex flex-col gap-4">
+        <div id="resume-banner-slot">
+          {{if .Config.ResumeSessionID}}
+          <div class="px-3 py-2 rounded-md bg-[#e8f0f8] border border-[#b8cee6] text-[#1f4b7a] text-[12.5px] flex items-center justify-between gap-2">
+            <span>Context queued from session <strong class="font-mono">{{.Config.ResumeSessionID}}</strong>. Click <strong>Start Live Session</strong> to continue that conversation.</span>
+            <button type="button" onclick="this.parentElement.remove()" class="text-[11px] underline cursor-pointer">Dismiss</button>
+          </div>
+          {{end}}
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-12 gap-5 flex-1 min-h-0">
+
+          <!-- Left Column: Hardware I/O & Vision (5 cols) -->
+          <div class="lg:col-span-5 flex flex-col gap-4 overflow-y-auto">
+
+            <!-- Audio Card -->
+            <div class="bg-white rounded-md border border-[#e4e4df] p-4 flex flex-col gap-3">
+              <div class="flex items-center justify-between">
+                <span class="text-[13px] font-semibold text-[#1a1a19]">Audio Stream (16kHz In / 24kHz Out)</span>
+                <div class="flex items-center gap-1.5">
+                  <button type="button" id="btn-mute" disabled
+                    class="px-2.5 py-1 rounded border border-[#d4d4ce] bg-[#f9f9f7] text-[#1a1a19] text-[11.5px] disabled:opacity-40 cursor-pointer">
+                    Mute Mic (M)
+                  </button>
+                </div>
+              </div>
+
+              <div class="grid grid-cols-2 gap-2.5 text-[12px]">
+                <div class="p-2.5 rounded bg-[#f9f9f7] border border-[#e4e4df]">
+                  <div class="flex items-center justify-between text-[#666660] mb-1">
+                    <span>Mic Input RMS</span>
+                    <span id="mic-rms-val" class="font-mono text-[#1a1a19]">0</span>
+                  </div>
+                  <div class="w-full h-2 bg-[#e4e4df] rounded overflow-hidden">
+                    <div id="mic-level-bar" class="h-full bg-[#1f4b7a] transition-all duration-75" style="width: 0%"></div>
+                  </div>
+                  <div id="mic-gate-status" class="text-[11px] text-[#777770] mt-1">Idle</div>
+                </div>
+
+                <div class="p-2.5 rounded bg-[#f9f9f7] border border-[#e4e4df] flex flex-col justify-between">
+                  <div class="flex items-center justify-between text-[#666660]">
+                    <span>Speaker Output</span>
+                    <span id="speaker-state-badge" class="font-mono text-[11px] text-[#555550]">Silent</span>
+                  </div>
+                  <div class="text-[11px] text-[#777770] mt-2">
+                    Echo Shield: <span id="echo-shield-indicator" class="font-medium text-[#1a1a19]">{{if .Config.EchoShield}}On (Barge-In &gt; {{.Config.BargeInThreshold}}){{else}}Off{{end}}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Vision Input Card (Webcam / Screen / HD Snapshot) -->
+            <div class="bg-white rounded-md border border-[#e4e4df] p-4 flex flex-col gap-3">
+              <div class="flex items-center justify-between flex-wrap gap-2">
+                <span class="text-[13px] font-semibold text-[#1a1a19]">Vision Input</span>
+                <div class="flex items-center gap-1.5 flex-wrap">
+                  <select id="vision-res-select"
+                    class="px-2 py-1 rounded border border-[#d4d4ce] bg-[#f9f9f7] text-[11.5px] text-[#1a1a19]"
+                    title="Frame capture resolution">
+                    <option value="640" {{if eq .Config.VisionResolution 640}}selected{{end}}>640p Standard</option>
+                    <option value="1080" {{if eq .Config.VisionResolution 1080}}selected{{end}}>1080p HD</option>
+                    <option value="1280" {{if eq .Config.VisionResolution 1280}}selected{{end}}>1280p Crisp Text</option>
+                  </select>
+                  <button type="button" id="btn-mirror"
+                    class="px-2 py-1 rounded border border-[#d4d4ce] bg-[#f9f9f7] text-[11.5px] text-[#1a1a19] cursor-pointer">
+                    Mirror
+                  </button>
+                  <button type="button" id="btn-webcam"
+                    class="px-2.5 py-1 rounded border border-[#d4d4ce] bg-[#f9f9f7] hover:bg-[#e8f0f8] text-[11.5px] text-[#1a1a19] cursor-pointer">
+                    Webcam
+                  </button>
+                  <button type="button" id="btn-screen"
+                    class="px-2.5 py-1 rounded border border-[#d4d4ce] bg-[#f9f9f7] hover:bg-[#e8f0f8] text-[11.5px] text-[#1a1a19] cursor-pointer">
+                    Screen
+                  </button>
+                </div>
+              </div>
+
+              <div class="relative w-full aspect-video bg-[#f4f4f0] rounded border border-[#e4e4df] overflow-hidden flex items-center justify-center">
+                <video id="vision-video" autoplay playsinline muted class="w-full h-full object-contain hidden"></video>
+                <canvas id="vision-canvas" class="hidden"></canvas>
+                <div id="vision-placeholder" class="text-[12px] text-[#777770] text-center px-4">
+                  Camera &amp; Screen share off. Enable Webcam or Screen to stream 1 FPS vision + on-demand HD snapshots to Gemini.
+                </div>
+              </div>
+
+              <div class="flex items-center justify-between text-[11.5px] text-[#666660]">
+                <span id="vision-status-label">No active video stream</span>
+                <button type="button" id="btn-snap-hd" disabled
+                  class="px-2.5 py-1 rounded border border-[#b8cee6] bg-[#e8f0f8] text-[#1f4b7a] disabled:opacity-40 cursor-pointer">
+                  Send HD Frame Now
+                </button>
+              </div>
+            </div>
+
+          </div>
+
+          <!-- Right Column: Live Transcript & Tool Cards (7 cols) -->
+          <div class="lg:col-span-7 bg-white rounded-md border border-[#e4e4df] flex flex-col min-h-[420px] overflow-hidden">
+            <div class="px-4 py-3 border-b border-[#e4e4df] flex items-center justify-between">
+              <div class="flex items-center gap-2">
+                <span class="text-[13px] font-semibold text-[#1a1a19]">Session Transcript</span>
+                <span id="last-latency-badge" class="hidden text-[11px] font-mono px-2 py-0.5 rounded bg-[#e6f3ec] text-[#1f5c3a] border border-[#bfe0ce]"></span>
+              </div>
+              <div class="flex items-center gap-1.5">
+                <button type="button" id="btn-copy-transcript"
+                  class="px-2.5 py-1 rounded border border-[#d4d4ce] bg-[#f9f9f7] hover:bg-[#f0f0ec] text-[11.5px] text-[#1a1a19] cursor-pointer">
+                  Copy Transcript
+                </button>
+                <button type="button" id="btn-clear-transcript"
+                  class="px-2.5 py-1 rounded border border-[#d4d4ce] bg-[#f9f9f7] hover:bg-[#f0f0ec] text-[11.5px] text-[#666660] cursor-pointer">
+                  Clear
+                </button>
+              </div>
+            </div>
+
+            <div id="transcript-feed" class="flex-1 overflow-y-auto p-4 flex flex-col gap-2.5 bg-[#f9f9f7]/50">
+              <div id="transcript-empty" class="text-[12.5px] text-[#777770] p-4 text-center">
+                Click <strong>Start Live Session</strong> and speak in English or Indonesian, or type a message below.
+              </div>
+            </div>
+
+            <form id="text-chat-form" class="p-3 border-t border-[#e4e4df] bg-white flex items-center gap-2">
+              <input type="text" id="text-chat-input"
+                placeholder="Type a message or question to Gemini during live session..."
+                class="flex-1 px-3 py-2 rounded border border-[#d4d4ce] bg-[#f9f9f7] focus:bg-white focus:outline-none focus:border-[#1a1a19] text-[13px]" />
+              <button type="submit" id="btn-send-text"
+                class="px-4 py-2 rounded bg-[#1a1a19] text-white text-[12.5px] font-medium hover:bg-[#333330] cursor-pointer">
+                Send
+              </button>
+            </form>
+          </div>
+
+        </div>
+      </section>
+
+      <!-- ================================================================= -->
+      <!-- TAB 2: CONFIGURATION                                              -->
+      <!-- ================================================================= -->
+      <section id="tab-config" class="tab-panel hidden max-w-4xl flex flex-col gap-5">
+        <form hx-post="/htmx/config" hx-target="#config-save-badge" hx-swap="innerHTML" class="flex flex-col gap-5">
+          <div class="bg-white rounded-md border border-[#e4e4df] p-5 flex flex-col gap-4">
+            <div class="flex items-center justify-between border-b border-[#e4e4df] pb-3">
+              <div>
+                <h2 class="text-[14px] font-semibold text-[#1a1a19]">Model, Persona &amp; Response Style</h2>
+                <p class="text-[12px] text-[#666660]">Runtime self-awareness (model ID, voice, active key, Go/HTMX stack, local time) is automatically appended to your instructions.</p>
+              </div>
+              <div class="flex items-center gap-2">
+                <div id="config-save-badge"></div>
+                <button type="submit" class="px-4 py-1.5 rounded bg-[#1a1a19] text-white text-[12.5px] font-medium cursor-pointer">
+                  Save Configuration
+                </button>
+              </div>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div>
+                <label class="block text-[12px] font-medium text-[#444440] mb-1">Model</label>
+                <input type="text" name="model" value="{{.Config.Model}}"
+                  class="w-full px-3 py-1.5 rounded border border-[#d4d4ce] bg-[#f9f9f7] font-mono text-[12.5px]" />
+              </div>
+              <div>
+                <label class="block text-[12px] font-medium text-[#444440] mb-1">Response Style</label>
+                <select name="response_style" class="w-full px-3 py-1.5 rounded border border-[#d4d4ce] bg-white text-[12.5px]">
+                  <option value="concise" {{if eq .Config.ResponseStyle "concise"}}selected{{end}}>Concise (1-2 sentences)</option>
+                  <option value="balanced" {{if eq .Config.ResponseStyle "balanced"}}selected{{end}}>Balanced (2-4 sentences)</option>
+                  <option value="detailed" {{if eq .Config.ResponseStyle "detailed"}}selected{{end}}>Detailed &amp; thorough</option>
+                </select>
+              </div>
+              <div>
+                <label class="block text-[12px] font-medium text-[#444440] mb-1">Temperature ({{.Config.Temperature}})</label>
+                <input type="number" step="0.05" min="0" max="2" name="temperature" value="{{.Config.Temperature}}"
+                  class="w-full px-3 py-1.5 rounded border border-[#d4d4ce] bg-white text-[12.5px]" />
+              </div>
+            </div>
+
+            <div>
+              <label class="block text-[12px] font-medium text-[#444440] mb-1">System Instruction</label>
+              <textarea name="system_instruction" rows="4"
+                class="w-full p-3 rounded border border-[#d4d4ce] bg-[#f9f9f7] focus:bg-white text-[13px] leading-relaxed">{{.Config.SystemInstruction}}</textarea>
+            </div>
+          </div>
+
+          <!-- Bilingual STT & Custom Vocabulary -->
+          <div class="bg-white rounded-md border border-[#e4e4df] p-5 flex flex-col gap-4">
+            <div class="border-b border-[#e4e4df] pb-2">
+              <h2 class="text-[14px] font-semibold text-[#1a1a19]">Speech Recognition (Bilingual STT &amp; Custom Vocabulary)</h2>
+              <p class="text-[12px] text-[#666660]">Bias speech-to-text toward English + Bahasa Indonesia and your custom domain terms.</p>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <label class="block text-[12px] font-medium text-[#444440] mb-1">Language Codes (comma-separated BCP-47)</label>
+                <input type="text" name="stt_languages" value="{{.Config.SttLanguages}}"
+                  class="w-full px-3 py-1.5 rounded border border-[#d4d4ce] bg-white font-mono text-[12.5px]" />
+              </div>
+              <div>
+                <label class="block text-[12px] font-medium text-[#444440] mb-1">Transcription Mode</label>
+                <select name="transcription_mode" class="w-full px-3 py-1.5 rounded border border-[#d4d4ce] bg-white text-[12.5px]">
+                  <option value="SMART" {{if eq .Config.TranscriptionMode "SMART"}}selected{{end}}>SMART (Clean &amp; readable)</option>
+                  <option value="VERBATIM" {{if eq .Config.TranscriptionMode "VERBATIM"}}selected{{end}}>VERBATIM (Exact word-for-word)</option>
+                </select>
+              </div>
+            </div>
+
+            <div>
+              <label class="block text-[12px] font-medium text-[#444440] mb-1">Custom Vocabulary Phrases (comma-separated)</label>
+              <input type="text" name="custom_vocabulary" value="{{.Config.CustomVocabulary}}"
+                class="w-full px-3 py-1.5 rounded border border-[#d4d4ce] bg-white text-[12.5px]" />
+            </div>
+          </div>
+
+          <!-- Server VAD & Proactivity -->
+          <div class="bg-white rounded-md border border-[#e4e4df] p-5 flex flex-col gap-4">
+            <div class="border-b border-[#e4e4df] pb-2">
+              <h2 class="text-[14px] font-semibold text-[#1a1a19]">Server VAD, Barge-In &amp; Context Window</h2>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <label class="block text-[12px] font-medium text-[#444440] mb-1">Activity Handling (Barge-In)</label>
+                <select name="activity_handling" class="w-full px-3 py-1.5 rounded border border-[#d4d4ce] bg-white text-[12.5px]">
+                  <option value="START_OF_ACTIVITY_INTERRUPTS" {{if eq .Config.ActivityHandling "START_OF_ACTIVITY_INTERRUPTS"}}selected{{end}}>START_OF_ACTIVITY_INTERRUPTS (Natural Barge-In)</option>
+                  <option value="NO_INTERRUPTION" {{if eq .Config.ActivityHandling "NO_INTERRUPTION"}}selected{{end}}>NO_INTERRUPTION (Finish speaking first)</option>
+                </select>
+              </div>
+              <div>
+                <label class="block text-[12px] font-medium text-[#444440] mb-1">Turn Coverage</label>
+                <select name="turn_coverage" class="w-full px-3 py-1.5 rounded border border-[#d4d4ce] bg-white text-[12.5px]">
+                  <option value="TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO" {{if eq .Config.TurnCoverage "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO"}}selected{{end}}>TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO</option>
+                  <option value="TURN_INCLUDES_ONLY_ACTIVITY" {{if eq .Config.TurnCoverage "TURN_INCLUDES_ONLY_ACTIVITY"}}selected{{end}}>TURN_INCLUDES_ONLY_ACTIVITY</option>
+                  <option value="TURN_INCLUDES_ALL_INPUT" {{if eq .Config.TurnCoverage "TURN_INCLUDES_ALL_INPUT"}}selected{{end}}>TURN_INCLUDES_ALL_INPUT</option>
+                </select>
+              </div>
+              <div>
+                <label class="block text-[12px] font-medium text-[#444440] mb-1">Start of Speech Sensitivity</label>
+                <select name="start_sensitivity" class="w-full px-3 py-1.5 rounded border border-[#d4d4ce] bg-white text-[12.5px]">
+                  <option value="START_SENSITIVITY_HIGH" {{if eq .Config.StartSensitivity "START_SENSITIVITY_HIGH"}}selected{{end}}>HIGH</option>
+                  <option value="START_SENSITIVITY_LOW" {{if eq .Config.StartSensitivity "START_SENSITIVITY_LOW"}}selected{{end}}>LOW</option>
+                </select>
+              </div>
+              <div>
+                <label class="block text-[12px] font-medium text-[#444440] mb-1">End of Speech Sensitivity</label>
+                <select name="end_sensitivity" class="w-full px-3 py-1.5 rounded border border-[#d4d4ce] bg-white text-[12.5px]">
+                  <option value="END_SENSITIVITY_HIGH" {{if eq .Config.EndSensitivity "END_SENSITIVITY_HIGH"}}selected{{end}}>HIGH</option>
+                  <option value="END_SENSITIVITY_LOW" {{if eq .Config.EndSensitivity "END_SENSITIVITY_LOW"}}selected{{end}}>LOW</option>
+                </select>
+              </div>
+              <div>
+                <label class="block text-[12px] font-medium text-[#444440] mb-1">Prefix Padding (ms)</label>
+                <input type="number" name="prefix_padding_ms" value="{{.Config.PrefixPaddingMs}}"
+                  class="w-full px-3 py-1.5 rounded border border-[#d4d4ce] bg-white text-[12.5px]" />
+              </div>
+              <div>
+                <label class="block text-[12px] font-medium text-[#444440] mb-1">Silence Duration (ms)</label>
+                <input type="number" name="silence_duration_ms" value="{{.Config.SilenceDurationMs}}"
+                  class="w-full px-3 py-1.5 rounded border border-[#d4d4ce] bg-white text-[12.5px]" />
+              </div>
+              <div>
+                <label class="block text-[12px] font-medium text-[#444440] mb-1">Compression Trigger Tokens</label>
+                <input type="number" name="trigger_tokens" value="{{.Config.TriggerTokens}}"
+                  class="w-full px-3 py-1.5 rounded border border-[#d4d4ce] bg-white text-[12.5px]" />
+              </div>
+              <div>
+                <label class="block text-[12px] font-medium text-[#444440] mb-1">Sliding Window Target Tokens</label>
+                <input type="number" name="target_tokens" value="{{.Config.TargetTokens}}"
+                  class="w-full px-3 py-1.5 rounded border border-[#d4d4ce] bg-white text-[12.5px]" />
+              </div>
+            </div>
+
+            <div class="flex flex-wrap items-center gap-6 pt-2">
+              <label class="inline-flex items-center gap-2 text-[12.5px] cursor-pointer">
+                <input type="hidden" name="proactive_audio" value="false" />
+                <input type="checkbox" name="proactive_audio" value="true" {{if .Config.ProactiveAudio}}checked{{end}} />
+                <span>Proactive Audio (Ignore background chatter not addressed to Gemini)</span>
+              </label>
+              <label class="inline-flex items-center gap-2 text-[12.5px] cursor-pointer">
+                <input type="hidden" name="auto_extract_memory" value="false" />
+                <input type="checkbox" name="auto_extract_memory" value="true" {{if .Config.AutoExtractMemory}}checked{{end}} />
+                <span>Auto-extract memories &amp; session summary on disconnect</span>
+              </label>
+            </div>
+          </div>
+        </form>
+      </section>
+
+      <!-- ================================================================= -->
+      <!-- TAB 3: VOICE & AUDIO                                              -->
+      <!-- ================================================================= -->
+      <section id="tab-voice" class="tab-panel hidden max-w-4xl flex flex-col gap-5">
+        <div class="bg-white rounded-md border border-[#e4e4df] p-5 flex flex-col gap-4">
+          <div>
+            <h2 class="text-[14px] font-semibold text-[#1a1a19]">Prebuilt Voice Selection</h2>
+            <p class="text-[12px] text-[#666660]">Click any voice to select it for your next live connection.</p>
+          </div>
+          <div id="voice-grid-container" class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
+            {{voiceGridHTML .Config}}
+          </div>
+        </div>
+
+        <form hx-post="/htmx/config" hx-target="#voice-audio-save-badge" hx-swap="innerHTML"
+          class="bg-white rounded-md border border-[#e4e4df] p-5 flex flex-col gap-4">
+          <div class="flex items-center justify-between border-b border-[#e4e4df] pb-3">
+            <div>
+              <h2 class="text-[14px] font-semibold text-[#1a1a19]">Echo Shield, Smart Voice Barge-In &amp; Hardware Devices</h2>
+              <p class="text-[12px] text-[#666660]">Prevents Mac speaker playback from echoing into the mic while still allowing loud voice barge-in.</p>
+            </div>
+            <div class="flex items-center gap-2">
+              <div id="voice-audio-save-badge"></div>
+              <button type="submit" class="px-4 py-1.5 rounded bg-[#1a1a19] text-white text-[12.5px] font-medium cursor-pointer">
+                Save Audio Settings
+              </button>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label class="block text-[12px] font-medium text-[#444440] mb-1">Voice Barge-In RMS Threshold (While Speaker Playing)</label>
+              <input type="number" name="barge_in_threshold" value="{{.Config.BargeInThreshold}}" min="500" max="10000"
+                class="w-full px-3 py-1.5 rounded border border-[#d4d4ce] bg-white text-[12.5px]" />
+              <span class="text-[11px] text-[#777770]">Speaking louder than this RMS while Gemini is talking immediately interrupts Gemini (default: 3200).</span>
+            </div>
+            <div>
+              <label class="block text-[12px] font-medium text-[#444440] mb-1">Tool Response Scheduling</label>
+              <select name="tool_scheduling" class="w-full px-3 py-1.5 rounded border border-[#d4d4ce] bg-white text-[12.5px]">
+                <option value="WHEN_IDLE" {{if eq .Config.ToolScheduling "WHEN_IDLE"}}selected{{end}}>WHEN_IDLE (Speak after current phrase)</option>
+                <option value="INTERRUPT" {{if eq .Config.ToolScheduling "INTERRUPT"}}selected{{end}}>INTERRUPT (Speak immediately)</option>
+                <option value="SILENT" {{if eq .Config.ToolScheduling "SILENT"}}selected{{end}}>SILENT (Ingest tool result silently)</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="flex flex-wrap items-center gap-6">
+            <label class="inline-flex items-center gap-2 text-[12.5px] cursor-pointer">
+              <input type="hidden" name="echo_shield" value="false" />
+              <input type="checkbox" name="echo_shield" value="true" {{if .Config.EchoShield}}checked{{end}} />
+              <span>Enable Echo Shield (Suppress Speaker Feedback)</span>
+            </label>
+            <label class="inline-flex items-center gap-2 text-[12.5px] cursor-pointer">
+              <input type="hidden" name="voice_barge_in" value="false" />
+              <input type="checkbox" name="voice_barge_in" value="true" {{if .Config.VoiceBargeIn}}checked{{end}} />
+              <span>Allow Loud Voice Barge-In &amp; Keyboard Shortcuts (<kbd class="px-1 bg-[#f4f4f0] border rounded font-mono text-[11px]">Space</kbd> / <kbd class="px-1 bg-[#f4f4f0] border rounded font-mono text-[11px]">M</kbd>)</span>
+            </label>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-4 pt-2 border-t border-[#e4e4df]">
+            <div>
+              <label class="block text-[12px] font-medium text-[#444440] mb-1">Microphone Device</label>
+              <select id="select-mic-device" class="w-full px-2.5 py-1.5 rounded border border-[#d4d4ce] bg-[#f9f9f7] text-[12px]"></select>
+            </div>
+            <div>
+              <label class="block text-[12px] font-medium text-[#444440] mb-1">Speaker Output Device</label>
+              <select id="select-speaker-device" class="w-full px-2.5 py-1.5 rounded border border-[#d4d4ce] bg-[#f9f9f7] text-[12px]"></select>
+            </div>
+            <div>
+              <label class="block text-[12px] font-medium text-[#444440] mb-1">Camera Device</label>
+              <select id="select-camera-device" class="w-full px-2.5 py-1.5 rounded border border-[#d4d4ce] bg-[#f9f9f7] text-[12px]"></select>
+            </div>
+          </div>
+        </form>
+      </section>
+
+      <!-- ================================================================= -->
+      <!-- TAB 4: MEMORY BANK                                                -->
+      <!-- ================================================================= -->
+      <section id="tab-memory" class="tab-panel hidden max-w-4xl flex flex-col gap-5">
+        <div class="bg-white rounded-md border border-[#e4e4df] p-5 flex flex-col gap-4">
+          <div class="flex items-center justify-between flex-wrap gap-2">
+            <div>
+              <h2 class="text-[14px] font-semibold text-[#1a1a19]">Persistent Memory Bank (memory.json)</h2>
+              <p class="text-[12px] text-[#666660]">Pinned memories and your rolling Last Session Summary are always prioritized in Gemini's system prompt.</p>
+            </div>
+            <button type="button"
+              hx-post="/htmx/memory/clear"
+              hx-confirm="Are you sure you want to clear all saved memories?"
+              hx-target="#memory-list-container"
+              hx-swap="innerHTML"
+              class="px-3 py-1 rounded border border-[#f2cbc6] bg-[#fae8e6] text-[#8a261d] text-[12px] cursor-pointer">
+              Clear All
+            </button>
+          </div>
+
+          <!-- Add Memory Form -->
+          <form hx-post="/htmx/memory/add" hx-target="#memory-list-container" hx-swap="innerHTML"
+            onreset="this.querySelector('input[name=fact]').value=''"
+            hx-on::after-request="if(event.detail.successful) this.reset()"
+            class="flex flex-wrap items-center gap-2 p-3 rounded bg-[#f9f9f7] border border-[#e4e4df]">
+            <input type="text" name="fact" required placeholder="Add a durable fact, preference, or project note..."
+              class="flex-1 min-w-[240px] px-3 py-1.5 rounded border border-[#d4d4ce] bg-white text-[13px]" />
+            <select name="category" class="px-2.5 py-1.5 rounded border border-[#d4d4ce] bg-white text-[12.5px]">
+              <option value="preference">preference</option>
+              <option value="project">project</option>
+              <option value="personal">personal</option>
+              <option value="task">task</option>
+              <option value="general">general</option>
+            </select>
+            <label class="inline-flex items-center gap-1.5 text-[12px] px-2 cursor-pointer">
+              <input type="checkbox" name="pinned" value="true" />
+              <span>Pin</span>
+            </label>
+            <button type="submit" class="px-3.5 py-1.5 rounded bg-[#1a1a19] text-white text-[12.5px] font-medium cursor-pointer">
+              Add Fact
+            </button>
+          </form>
+
+          <!-- Search & Filter Bar -->
+          <div class="flex items-center gap-2">
+            <input type="search" name="q" placeholder="Filter memories..."
+              hx-get="/htmx/memory"
+              hx-trigger="keyup changed delay:200ms, search"
+              hx-target="#memory-list-container"
+              hx-include="[name='category_filter']"
+              class="flex-1 px-3 py-1.5 rounded border border-[#d4d4ce] bg-white text-[12.5px]" />
+            <select name="category" id="category_filter"
+              hx-get="/htmx/memory"
+              hx-trigger="change"
+              hx-target="#memory-list-container"
+              class="px-3 py-1.5 rounded border border-[#d4d4ce] bg-white text-[12.5px]">
+              <option value="all">All Categories</option>
+              <option value="summary">summary</option>
+              <option value="preference">preference</option>
+              <option value="project">project</option>
+              <option value="personal">personal</option>
+              <option value="task">task</option>
+              <option value="general">general</option>
+            </select>
+          </div>
+
+          <div id="memory-list-container" class="flex flex-col gap-2.5">
+            {{memoryListHTML}}
+          </div>
+        </div>
+      </section>
+
+      <!-- ================================================================= -->
+      <!-- TAB 5: TOOLS (12 MAC & WEB TOOLS)                                 -->
+      <!-- ================================================================= -->
+      <section id="tab-tools" class="tab-panel hidden max-w-4xl flex flex-col gap-5">
+        <form hx-post="/htmx/tools/toggle" hx-target="#tools-save-badge" hx-swap="innerHTML"
+          class="bg-white rounded-md border border-[#e4e4df] p-5 flex flex-col gap-4">
+          <div class="flex items-center justify-between border-b border-[#e4e4df] pb-3">
+            <div>
+              <h2 class="text-[14px] font-semibold text-[#1a1a19]">Local Mac &amp; Multi-Source Web Tools</h2>
+              <p class="text-[12px] text-[#666660]">Enable or disable tools exposed to Gemini Live during voice sessions.</p>
+            </div>
+            <div class="flex items-center gap-2">
+              <div id="tools-save-badge"></div>
+              <button type="submit" class="px-4 py-1.5 rounded bg-[#1a1a19] text-white text-[12.5px] font-medium cursor-pointer">
+                Save Active Tools
+              </button>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+            {{range .Tools}}
+            <label class="p-3 rounded-md border border-[#e4e4df] bg-[#f9f9f7] hover:bg-white flex items-start gap-3 cursor-pointer transition-colors">
+              <input type="checkbox" name="enabled_tools" value="{{.Name}}" {{if .Enabled}}checked{{end}} class="mt-1" />
+              <div class="flex-1 min-w-0">
+                <div class="flex items-center justify-between gap-2">
+                  <span class="font-mono text-[12.5px] font-semibold text-[#1a1a19]">{{.Name}}</span>
+                  <span class="text-[10.5px] px-1.5 py-0.5 rounded bg-white border border-[#e4e4df] text-[#666660]">{{.Category}}</span>
+                </div>
+                <p class="text-[12px] text-[#666660] mt-1 leading-snug">{{.Description}}</p>
+              </div>
+            </label>
+            {{end}}
+          </div>
+        </form>
+
+        <!-- Direct Tool Tester -->
+        <div class="bg-white rounded-md border border-[#e4e4df] p-5 flex flex-col gap-3">
+          <h3 class="text-[14px] font-semibold text-[#1a1a19]">Test Any Tool Locally</h3>
+          <form hx-post="/htmx/tools/test" hx-target="#tool-test-output" hx-swap="innerHTML" class="flex flex-col gap-3">
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+              <div>
+                <label class="block text-[12px] font-medium text-[#444440] mb-1">Tool Name</label>
+                <select name="name" id="tool-tester-select"
+                  onchange="const opt = this.options[this.selectedIndex]; document.getElementById('tool-tester-args').value = opt.getAttribute('data-sample') || '{}';"
+                  class="w-full px-3 py-1.5 rounded border border-[#d4d4ce] bg-white font-mono text-[12.5px]">
+                  {{range .Tools}}
+                  <option value="{{.Name}}" data-sample="{{.SampleArgs}}">{{.Name}}</option>
+                  {{end}}
+                </select>
+              </div>
+              <div class="md:col-span-2">
+                <label class="block text-[12px] font-medium text-[#444440] mb-1">JSON Arguments</label>
+                <div class="flex items-center gap-2">
+                  <input type="text" name="args" id="tool-tester-args" value="{}"
+                    class="flex-1 px-3 py-1.5 rounded border border-[#d4d4ce] bg-[#f9f9f7] font-mono text-[12.5px]" />
+                  <button type="submit" class="px-4 py-1.5 rounded bg-[#1a1a19] text-white text-[12.5px] font-medium cursor-pointer">
+                    Run Tool
+                  </button>
+                </div>
+              </div>
+            </div>
+          </form>
+          <div id="tool-test-output"></div>
+        </div>
+      </section>
+
+      <!-- ================================================================= -->
+      <!-- TAB 6: SESSION HISTORY                                            -->
+      <!-- ================================================================= -->
+      <section id="tab-sessions" class="tab-panel hidden h-full flex flex-col gap-4">
+        <div class="grid grid-cols-1 lg:grid-cols-12 gap-5 flex-1 min-h-[480px]">
+          <div class="lg:col-span-4 bg-white rounded-md border border-[#e4e4df] p-4 flex flex-col gap-3 overflow-y-auto">
+            <div class="flex items-center justify-between">
+              <h2 class="text-[14px] font-semibold text-[#1a1a19]">Saved Sessions</h2>
+              <button type="button"
+                hx-get="/htmx/sessions"
+                hx-target="#sessions-list-container"
+                hx-swap="innerHTML"
+                class="text-[11.5px] px-2 py-0.5 rounded border border-[#d4d4ce] bg-[#f9f9f7] cursor-pointer">
+                Refresh
+              </button>
+            </div>
+            <div id="sessions-list-container" class="flex flex-col gap-2">
+              {{sessionsListHTML}}
+            </div>
+          </div>
+
+          <div id="session-detail-container" class="lg:col-span-8 bg-white rounded-md border border-[#e4e4df] p-5 overflow-y-auto">
+            <div class="text-[13px] text-[#666660]">Select a session on the left to inspect its transcript, tool results, or resume it in Live Studio.</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================================================================= -->
+      <!-- TAB 7: API KEYS                                                   -->
+      <!-- ================================================================= -->
+      <section id="tab-keys" class="tab-panel hidden max-w-4xl flex flex-col gap-5">
+        <div class="bg-white rounded-md border border-[#e4e4df] p-5 flex flex-col gap-4">
+          <div>
+            <h2 class="text-[14px] font-semibold text-[#1a1a19]">Gemini API Keys (.env)</h2>
+            <p class="text-[12px] text-[#666660]">Select AUTO failover rotation or lock onto a specific key slot. Test any key live against Gemini.</p>
+          </div>
+
+          <div id="keys-list-container" class="flex flex-col gap-2.5">
+            {{keysListHTML .Config}}
+          </div>
+
+          <form hx-post="/htmx/keys/add" hx-target="#keys-list-container" hx-swap="innerHTML"
+            hx-on::after-request="if(event.detail.successful) this.reset()"
+            class="pt-4 border-t border-[#e4e4df] flex flex-wrap items-end gap-3">
+            <div>
+              <label class="block text-[12px] font-medium text-[#444440] mb-1">Env Variable Name</label>
+              <input type="text" name="name" placeholder="GEMINI_API_KEY_6" required
+                class="px-3 py-1.5 rounded border border-[#d4d4ce] bg-[#f9f9f7] font-mono text-[12.5px]" />
+            </div>
+            <div class="flex-1 min-w-[240px]">
+              <label class="block text-[12px] font-medium text-[#444440] mb-1">API Key Value</label>
+              <input type="password" name="value" placeholder="AIzaSy..." required
+                class="w-full px-3 py-1.5 rounded border border-[#d4d4ce] bg-[#f9f9f7] font-mono text-[12.5px]" />
+            </div>
+            <button type="submit" class="px-4 py-1.5 rounded bg-[#1a1a19] text-white text-[12.5px] font-medium cursor-pointer">
+              Save Key to .env
+            </button>
+          </form>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <script src="/static/media_bridge.js"></script>
+</body>
+</html>

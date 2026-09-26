@@ -1,9 +1,36 @@
-# Environment variables and secrets
+# ==============================================================================
+# Secrets & Environment Variables (NEVER COMMIT)
+# ==============================================================================
 .env
 .env.*
 !.env.example
+*.pem
+*.key
+*credentials*.json
+*secret*
 
-# Python
+# ==============================================================================
+# Runtime User Data, Sessions, Memories & Local State (NEVER COMMIT)
+# ==============================================================================
+config.json
+memory.json
+sessions/
+notes/
+*.log
+
+# ==============================================================================
+# Go & Python Build Artifacts / Virtual Environments
+# ==============================================================================
+lifel
+LIFE
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
 __pycache__/
 *.py[cod]
 *$py.class
@@ -11,7 +38,9 @@ venv/
 .venv/
 env/
 
-# OS and IDE files
+# ==============================================================================
+# OS & Editor Files
+# ==============================================================================
 .DS_Store
 Thumbs.db
 .idea/
