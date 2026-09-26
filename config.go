@@ -73,6 +73,9 @@ type AppConfig struct {
 	EchoShield                bool     `json:"echo_shield"`
 	VoiceBargeIn              bool     `json:"voice_barge_in"`
 	BargeInThreshold          int      `json:"barge_in_threshold"` // RMS threshold (e.g. 2800)
+	PushToTalk                bool     `json:"push_to_talk"`       // Hold V key to transmit mic audio
+	SpeakerVolume             int      `json:"speaker_volume"`     // 0 - 150 (%)
+	AutoReconnect             bool     `json:"auto_reconnect"`     // Auto reconnect on unexpected drop
 	StartSensitivity          string   `json:"start_sensitivity"`
 	EndSensitivity            string   `json:"end_sensitivity"`
 	PrefixPaddingMs           int32    `json:"prefix_padding_ms"`
@@ -116,6 +119,9 @@ func defaultConfig() AppConfig {
 		EchoShield:              true,
 		VoiceBargeIn:            true,
 		BargeInThreshold:        3200,
+		PushToTalk:              false,
+		SpeakerVolume:           100,
+		AutoReconnect:           true,
 		StartSensitivity:        "START_SENSITIVITY_LOW",
 		EndSensitivity:          "END_SENSITIVITY_LOW",
 		PrefixPaddingMs:         200,
@@ -724,3 +730,62 @@ func deleteSessionRecord(id string) {
 	_ = os.Remove(filepath.Join(sessionsDir, cleanID+".json"))
 	_ = os.Remove(filepath.Join(sessionsDir, cleanID+".md"))
 }
+
+// ==============================================================================
+// Workspace Notes (notes/*.md)
+// ==============================================================================
+
+type NoteItem struct {
+	Name      string `json:"name"`
+	UpdatedAt string `json:"updated_at"`
+	SizeBytes int64  `json:"size_bytes"`
+	Content   string `json:"content"`
+}
+
+func listNotes() []NoteItem {
+	entries, err := os.ReadDir(notesDir)
+	if err != nil {
+		return nil
+	}
+	var out []NoteItem
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(notesDir, e.Name()))
+		if err != nil {
+			continue
+		}
+		out = append(out, NoteItem{
+			Name:      e.Name(),
+			UpdatedAt: info.ModTime().Format("2006-01-02 15:04:05"),
+			SizeBytes: info.Size(),
+			Content:   string(raw),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].UpdatedAt > out[j].UpdatedAt
+	})
+	return out
+}
+
+func saveNote(name, content string) error {
+	clean := reSafeTitle.ReplaceAllString(strings.TrimSuffix(strings.TrimSpace(name), ".md"), "_")
+	if clean == "" {
+		clean = "note"
+	}
+	clean += ".md"
+	return os.WriteFile(filepath.Join(notesDir, clean), []byte(content), 0644)
+}
+
+func deleteNote(name string) {
+	clean := filepath.Base(name)
+	if strings.HasSuffix(clean, ".md") {
+		_ = os.Remove(filepath.Join(notesDir, clean))
+	}
+}
+

@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"html"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -15,9 +17,11 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 
 	"google.golang.org/genai"
 )
@@ -454,17 +458,16 @@ func executeLocalTool(name string, args map[string]any) map[string]any {
 		if expr == "" {
 			return map[string]any{"error": "expression is required"}
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		pyCode := fmt.Sprintf(
-			"import math, json; env={k:getattr(math,k) for k in dir(math) if not k.startswith('_')}; env.update({'abs':abs,'round':round,'min':min,'max':max,'pow':pow}); print(json.dumps({'result': eval(%q, {'__builtins__':{}}, env)}))",
-			expr,
-		)
-		out, err := exec.CommandContext(ctx, "python3", "-c", pyCode).Output()
+		val, err := evalMathExpression(expr)
 		if err != nil {
-			return map[string]any{"expression": expr, "error": "failed to evaluate expression"}
+			return map[string]any{"expression": expr, "error": err.Error()}
 		}
-		return map[string]any{"expression": expr, "output": strings.TrimSpace(string(out))}
+		formatted := strconv.FormatFloat(val, 'f', -1, 64)
+		return map[string]any{
+			"expression": expr,
+			"result":     val,
+			"formatted":  formatted,
+		}
 
 	case "mac_clipboard":
 		action := strings.ToLower(strArg("action"))
@@ -498,28 +501,314 @@ func executeLocalTool(name string, args map[string]any) map[string]any {
 			}
 			return map[string]any{"status": "opened_url", "target": target}
 		}
+		// Check if target is an existing file inside workspace first
 		fullPath := filepath.Clean(filepath.Join(baseDir, target))
-		if !strings.HasPrefix(fullPath, baseDir) {
-			return map[string]any{"error": "access outside workspace is restricted"}
+		if strings.HasPrefix(fullPath, baseDir) {
+			if _, err := os.Stat(fullPath); err == nil {
+				if err := exec.Command("open", fullPath).Start(); err != nil {
+					return map[string]any{"error": err.Error()}
+				}
+				return map[string]any{"status": "opened_workspace_path", "target": target}
+			}
 		}
-		if err := exec.Command("open", fullPath).Start(); err != nil {
-			return map[string]any{"error": err.Error()}
+		// Otherwise treat target as a macOS application name (e.g., "Calculator", "Safari", "Notes")
+		if !strings.Contains(target, "/") && !strings.Contains(target, "..") {
+			if err := exec.Command("open", "-a", target).Start(); err != nil {
+				return map[string]any{"error": fmt.Sprintf("could not open application %q: %v", target, err)}
+			}
+			return map[string]any{"status": "opened_application", "app": target}
 		}
-		return map[string]any{"status": "opened_path", "target": fullPath}
+		return map[string]any{"error": "target not found in workspace and is not a valid application name"}
 
 	case "capture_mac_screen":
 		source := strArg("source")
 		if source == "" {
 			source = "auto"
 		}
-		return map[string]any{
-			"status":  "frame_requested",
-			"source":  source,
-			"message": "High-resolution 1280p frame requested from active stream / display.",
+		out := map[string]any{
+			"status":                    "frame_requested",
+			"source":                    source,
+			"_request_browser_hd_frame": true,
+			"message":                   "Requested 1280p HD frame from active browser stream.",
 		}
+		// Also attempt native macOS screencapture if source is "screen" or "auto"
+		if source == "screen" || source == "auto" {
+			tmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("lifel_screen_%d.jpg", time.Now().UnixNano()))
+			defer os.Remove(tmpFile)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if err := exec.CommandContext(ctx, "screencapture", "-x", "-t", "jpg", tmpFile).Run(); err == nil {
+				_ = exec.CommandContext(ctx, "sips", "-Z", "1280", tmpFile).Run()
+				if rawBytes, err := os.ReadFile(tmpFile); err == nil && len(rawBytes) > 0 {
+					out["_native_screen_b64"] = base64.StdEncoding.EncodeToString(rawBytes)
+					out["native_capture"] = true
+					out["message"] = "Captured native 1280p macOS screen JPEG and requested active browser HD frame."
+				}
+			}
+		}
+		return out
 	}
 
 	return map[string]any{"error": fmt.Sprintf("unknown tool %q", name)}
+}
+
+// ==============================================================================
+// Native Go Recursive-Descent Mathematical Expression Evaluator
+// ==============================================================================
+
+type mathParser struct {
+	input string
+	pos   int
+}
+
+func evalMathExpression(expr string) (float64, error) {
+	cleaned := strings.ReplaceAll(expr, "**", "^")
+	p := &mathParser{input: cleaned}
+	val, err := p.parseExpr()
+	if err != nil {
+		return 0, err
+	}
+	p.skipSpaces()
+	if p.pos < len(p.input) {
+		return 0, fmt.Errorf("unexpected token at %q", p.input[p.pos:])
+	}
+	if math.IsNaN(val) || math.IsInf(val, 0) {
+		return 0, fmt.Errorf("math result is undefined or infinite")
+	}
+	return val, nil
+}
+
+func (p *mathParser) skipSpaces() {
+	for p.pos < len(p.input) && unicode.IsSpace(rune(p.input[p.pos])) {
+		p.pos++
+	}
+}
+
+func (p *mathParser) parseExpr() (float64, error) {
+	left, err := p.parseTerm()
+	if err != nil {
+		return 0, err
+	}
+	for {
+		p.skipSpaces()
+		if p.pos >= len(p.input) {
+			break
+		}
+		op := p.input[p.pos]
+		if op != '+' && op != '-' {
+			break
+		}
+		p.pos++
+		right, err := p.parseTerm()
+		if err != nil {
+			return 0, err
+		}
+		if op == '+' {
+			left += right
+		} else {
+			left -= right
+		}
+	}
+	return left, nil
+}
+
+func (p *mathParser) parseTerm() (float64, error) {
+	left, err := p.parsePower()
+	if err != nil {
+		return 0, err
+	}
+	for {
+		p.skipSpaces()
+		if p.pos >= len(p.input) {
+			break
+		}
+		op := p.input[p.pos]
+		if op != '*' && op != '/' && op != '%' {
+			break
+		}
+		p.pos++
+		right, err := p.parsePower()
+		if err != nil {
+			return 0, err
+		}
+		switch op {
+		case '*':
+			left *= right
+		case '/':
+			if right == 0 {
+				return 0, fmt.Errorf("division by zero")
+			}
+			left /= right
+		case '%':
+			if right == 0 {
+				return 0, fmt.Errorf("modulo by zero")
+			}
+			left = math.Mod(left, right)
+		}
+	}
+	return left, nil
+}
+
+func (p *mathParser) parsePower() (float64, error) {
+	base, err := p.parseUnary()
+	if err != nil {
+		return 0, err
+	}
+	p.skipSpaces()
+	if p.pos < len(p.input) && p.input[p.pos] == '^' {
+		p.pos++
+		exp, err := p.parsePower()
+		if err != nil {
+			return 0, err
+		}
+		return math.Pow(base, exp), nil
+	}
+	return base, nil
+}
+
+func (p *mathParser) parseUnary() (float64, error) {
+	p.skipSpaces()
+	if p.pos < len(p.input) {
+		if p.input[p.pos] == '+' {
+			p.pos++
+			return p.parseUnary()
+		}
+		if p.input[p.pos] == '-' {
+			p.pos++
+			v, err := p.parseUnary()
+			return -v, err
+		}
+	}
+	return p.parsePrimary()
+}
+
+func (p *mathParser) parsePrimary() (float64, error) {
+	p.skipSpaces()
+	if p.pos >= len(p.input) {
+		return 0, fmt.Errorf("unexpected end of expression")
+	}
+	if p.input[p.pos] == '(' {
+		p.pos++
+		val, err := p.parseExpr()
+		if err != nil {
+			return 0, err
+		}
+		p.skipSpaces()
+		if p.pos >= len(p.input) || p.input[p.pos] != ')' {
+			return 0, fmt.Errorf("missing closing parenthesis")
+		}
+		p.pos++
+		return val, nil
+	}
+
+	// Identifier (constant or function call)
+	if unicode.IsLetter(rune(p.input[p.pos])) {
+		start := p.pos
+		for p.pos < len(p.input) && (unicode.IsLetter(rune(p.input[p.pos])) || unicode.IsDigit(rune(p.input[p.pos]))) {
+			p.pos++
+		}
+		ident := strings.ToLower(p.input[start:p.pos])
+		p.skipSpaces()
+		if p.pos < len(p.input) && p.input[p.pos] == '(' {
+			p.pos++
+			arg1, err := p.parseExpr()
+			if err != nil {
+				return 0, err
+			}
+			var arg2 float64
+			hasArg2 := false
+			p.skipSpaces()
+			if p.pos < len(p.input) && p.input[p.pos] == ',' {
+				p.pos++
+				arg2, err = p.parseExpr()
+				if err != nil {
+					return 0, err
+				}
+				hasArg2 = true
+			}
+			p.skipSpaces()
+			if p.pos >= len(p.input) || p.input[p.pos] != ')' {
+				return 0, fmt.Errorf("missing ')' after function %s", ident)
+			}
+			p.pos++
+			switch ident {
+			case "sqrt":
+				return math.Sqrt(arg1), nil
+			case "sin":
+				return math.Sin(arg1), nil
+			case "cos":
+				return math.Cos(arg1), nil
+			case "tan":
+				return math.Tan(arg1), nil
+			case "asin":
+				return math.Asin(arg1), nil
+			case "acos":
+				return math.Acos(arg1), nil
+			case "atan":
+				return math.Atan(arg1), nil
+			case "log", "ln":
+				return math.Log(arg1), nil
+			case "log10":
+				return math.Log10(arg1), nil
+			case "log2":
+				return math.Log2(arg1), nil
+			case "exp":
+				return math.Exp(arg1), nil
+			case "abs":
+				return math.Abs(arg1), nil
+			case "floor":
+				return math.Floor(arg1), nil
+			case "ceil":
+				return math.Ceil(arg1), nil
+			case "round":
+				return math.Round(arg1), nil
+			case "pow":
+				if !hasArg2 {
+					return 0, fmt.Errorf("pow(x, y) requires 2 arguments")
+				}
+				return math.Pow(arg1, arg2), nil
+			case "min":
+				if !hasArg2 {
+					return arg1, nil
+				}
+				return math.Min(arg1, arg2), nil
+			case "max":
+				if !hasArg2 {
+					return arg1, nil
+				}
+				return math.Max(arg1, arg2), nil
+			default:
+				return 0, fmt.Errorf("unknown math function %q", ident)
+			}
+		}
+		switch ident {
+		case "pi":
+			return math.Pi, nil
+		case "e":
+			return math.E, nil
+		default:
+			return 0, fmt.Errorf("unknown constant %q", ident)
+		}
+	}
+
+	// Number literal
+	start := p.pos
+	for p.pos < len(p.input) && (unicode.IsDigit(rune(p.input[p.pos])) || p.input[p.pos] == '.') {
+		p.pos++
+	}
+	if p.pos < len(p.input) && (p.input[p.pos] == 'e' || p.input[p.pos] == 'E') {
+		p.pos++
+		if p.pos < len(p.input) && (p.input[p.pos] == '+' || p.input[p.pos] == '-') {
+			p.pos++
+		}
+		for p.pos < len(p.input) && unicode.IsDigit(rune(p.input[p.pos])) {
+			p.pos++
+		}
+	}
+	if start == p.pos {
+		return 0, fmt.Errorf("expected number at %q", p.input[p.pos:])
+	}
+	return strconv.ParseFloat(p.input[start:p.pos], 64)
 }
 
 // ==============================================================================

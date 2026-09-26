@@ -83,8 +83,12 @@
         <span class="text-[#666660]">Key Mode</span>
         <span id="sidebar-key-label" class="font-mono text-[#1a1a19]">{{.Config.SelectedKey}}</span>
       </div>
+      <div class="flex items-center justify-between">
+        <span class="text-[#666660]">WS Latency</span>
+        <span id="sidebar-rtt-label" class="font-mono text-[#666660]">--</span>
+      </div>
       <div class="pt-1 text-[11px] text-[#777770]">
-        Shortcuts: <kbd class="px-1 py-0.5 bg-white border border-[#d4d4ce] rounded font-mono">Space</kbd> Interrupt · <kbd class="px-1 py-0.5 bg-white border border-[#d4d4ce] rounded font-mono">M</kbd> Mute
+        Shortcuts: <kbd class="px-1 py-0.5 bg-white border border-[#d4d4ce] rounded font-mono">Space</kbd> Stop · <kbd class="px-1 py-0.5 bg-white border border-[#d4d4ce] rounded font-mono">M</kbd> Mute · <kbd class="px-1 py-0.5 bg-white border border-[#d4d4ce] rounded font-mono">V</kbd> PTT
       </div>
     </div>
   </aside>
@@ -147,9 +151,14 @@
 
             <!-- Audio Card -->
             <div class="bg-white rounded-md border border-[#e4e4df] p-4 flex flex-col gap-3">
-              <div class="flex items-center justify-between">
+              <div class="flex items-center justify-between flex-wrap gap-1.5">
                 <span class="text-[13px] font-semibold text-[#1a1a19]">Audio Stream (16kHz In / 24kHz Out)</span>
                 <div class="flex items-center gap-1.5">
+                  <button type="button" id="btn-ptt-mode"
+                    class="px-2 py-1 rounded border {{if .Config.PushToTalk}}border-[#b8cee6] bg-[#e8f0f8] text-[#1f4b7a] font-medium{{else}}border-[#d4d4ce] bg-[#f9f9f7] text-[#555550]{{end}} text-[11px] cursor-pointer"
+                    title="Toggle Push-to-Talk mode (Hold V key to talk)">
+                    {{if .Config.PushToTalk}}PTT On (Hold V){{else}}PTT Off (Open Mic){{end}}
+                  </button>
                   <button type="button" id="btn-mute" disabled
                     class="px-2.5 py-1 rounded border border-[#d4d4ce] bg-[#f9f9f7] text-[#1a1a19] text-[11.5px] disabled:opacity-40 cursor-pointer">
                     Mute Mic (M)
@@ -174,17 +183,23 @@
                     <span>Speaker Output</span>
                     <span id="speaker-state-badge" class="font-mono text-[11px] text-[#555550]">Silent</span>
                   </div>
-                  <div class="text-[11px] text-[#777770] mt-2">
+                  <div class="flex items-center gap-2 mt-1.5">
+                    <span class="text-[11px] text-[#666660] shrink-0">Vol</span>
+                    <input type="range" id="studio-volume-slider" min="0" max="150" value="{{.Config.SpeakerVolume}}"
+                      class="w-full accent-[#1a1a19] cursor-pointer h-1.5" />
+                    <span id="studio-volume-label" class="font-mono text-[11px] text-[#1a1a19] w-8 text-right">{{.Config.SpeakerVolume}}%</span>
+                  </div>
+                  <div class="text-[11px] text-[#777770] mt-1">
                     Echo Shield: <span id="echo-shield-indicator" class="font-medium text-[#1a1a19]">{{if .Config.EchoShield}}On (Barge-In &gt; {{.Config.BargeInThreshold}}){{else}}Off{{end}}</span>
                   </div>
                 </div>
               </div>
             </div>
 
-            <!-- Vision Input Card (Webcam / Screen / HD Snapshot) -->
+            <!-- Vision Input Card (Webcam / Screen / HD Snapshot / File Upload) -->
             <div class="bg-white rounded-md border border-[#e4e4df] p-4 flex flex-col gap-3">
               <div class="flex items-center justify-between flex-wrap gap-2">
-                <span class="text-[13px] font-semibold text-[#1a1a19]">Vision Input</span>
+                <span class="text-[13px] font-semibold text-[#1a1a19]">Vision &amp; File Input</span>
                 <div class="flex items-center gap-1.5 flex-wrap">
                   <select id="vision-res-select"
                     class="px-2 py-1 rounded border border-[#d4d4ce] bg-[#f9f9f7] text-[11.5px] text-[#1a1a19]"
@@ -208,20 +223,27 @@
                 </div>
               </div>
 
-              <div class="relative w-full aspect-video bg-[#f4f4f0] rounded border border-[#e4e4df] overflow-hidden flex items-center justify-center">
+              <div id="vision-dropzone" class="relative w-full aspect-video bg-[#f4f4f0] rounded border border-[#e4e4df] overflow-hidden flex items-center justify-center">
                 <video id="vision-video" autoplay playsinline muted class="w-full h-full object-contain hidden"></video>
                 <canvas id="vision-canvas" class="hidden"></canvas>
                 <div id="vision-placeholder" class="text-[12px] text-[#777770] text-center px-4">
-                  Camera &amp; Screen share off. Enable Webcam or Screen to stream 1 FPS vision + on-demand HD snapshots to Gemini.
+                  Camera &amp; Screen off. Enable Webcam/Screen or drag &amp; drop an image/file here to send to Gemini.
                 </div>
               </div>
 
-              <div class="flex items-center justify-between text-[11.5px] text-[#666660]">
+              <div class="flex items-center justify-between text-[11.5px] text-[#666660] flex-wrap gap-2">
                 <span id="vision-status-label">No active video stream</span>
-                <button type="button" id="btn-snap-hd" disabled
-                  class="px-2.5 py-1 rounded border border-[#b8cee6] bg-[#e8f0f8] text-[#1f4b7a] disabled:opacity-40 cursor-pointer">
-                  Send HD Frame Now
-                </button>
+                <div class="flex items-center gap-1.5">
+                  <input type="file" id="studio-file-upload" accept="image/*,.txt,.md,.go,.py,.json,.csv" class="hidden" />
+                  <button type="button" id="btn-upload-file"
+                    class="px-2.5 py-1 rounded border border-[#d4d4ce] bg-[#f9f9f7] hover:bg-[#e8f0f8] text-[#1a1a19] cursor-pointer">
+                    Upload Image / File
+                  </button>
+                  <button type="button" id="btn-snap-hd" disabled
+                    class="px-2.5 py-1 rounded border border-[#b8cee6] bg-[#e8f0f8] text-[#1f4b7a] disabled:opacity-40 cursor-pointer">
+                    Send HD Frame Now
+                  </button>
+                </div>
               </div>
             </div>
 
@@ -229,10 +251,11 @@
 
           <!-- Right Column: Live Transcript & Tool Cards (7 cols) -->
           <div class="lg:col-span-7 bg-white rounded-md border border-[#e4e4df] flex flex-col min-h-[420px] overflow-hidden">
-            <div class="px-4 py-3 border-b border-[#e4e4df] flex items-center justify-between">
-              <div class="flex items-center gap-2">
+            <div class="px-4 py-3 border-b border-[#e4e4df] flex items-center justify-between flex-wrap gap-2">
+              <div class="flex items-center gap-2 flex-wrap">
                 <span class="text-[13px] font-semibold text-[#1a1a19]">Session Transcript</span>
                 <span id="last-latency-badge" class="hidden text-[11px] font-mono px-2 py-0.5 rounded bg-[#e6f3ec] text-[#1f5c3a] border border-[#bfe0ce]"></span>
+                <span id="live-tokens-badge" class="hidden text-[11px] font-mono px-2 py-0.5 rounded bg-[#f0ecf8] text-[#3f2c6b] border border-[#d6c9ef]"></span>
               </div>
               <div class="flex items-center gap-1.5">
                 <button type="button" id="btn-copy-transcript"
@@ -250,6 +273,27 @@
               <div id="transcript-empty" class="text-[12.5px] text-[#777770] p-4 text-center">
                 Click <strong>Start Live Session</strong> and speak in English or Indonesian, or type a message below.
               </div>
+            </div>
+
+            <!-- Quick Prompt Starter Chips -->
+            <div class="px-3 py-2 border-t border-[#e4e4df] bg-[#f9f9f7] flex items-center gap-1.5 overflow-x-auto text-[11.5px]">
+              <span class="text-[#777770] shrink-0">Quick:</span>
+              <button type="button" data-prompt="Check my Mac's system status (battery, CPU, RAM, disk)."
+                class="quick-prompt-chip px-2 py-0.5 rounded border border-[#d4d4ce] bg-white hover:bg-[#e8f0f8] text-[#1a1a19] shrink-0 cursor-pointer">
+                Mac System Status
+              </button>
+              <button type="button" data-prompt="Read my Mac clipboard and summarize or explain what's in it."
+                class="quick-prompt-chip px-2 py-0.5 rounded border border-[#d4d4ce] bg-white hover:bg-[#e8f0f8] text-[#1a1a19] shrink-0 cursor-pointer">
+                Read Clipboard
+              </button>
+              <button type="button" data-prompt="Capture my Mac screen right now and tell me what you see."
+                class="quick-prompt-chip px-2 py-0.5 rounded border border-[#d4d4ce] bg-white hover:bg-[#e8f0f8] text-[#1a1a19] shrink-0 cursor-pointer">
+                Inspect Mac Screen
+              </button>
+              <button type="button" data-prompt="List the files in my current workspace directory."
+                class="quick-prompt-chip px-2 py-0.5 rounded border border-[#d4d4ce] bg-white hover:bg-[#e8f0f8] text-[#1a1a19] shrink-0 cursor-pointer">
+                Workspace Files
+              </button>
             </div>
 
             <form id="text-chat-form" class="p-3 border-t border-[#e4e4df] bg-white flex items-center gap-2">
@@ -537,16 +581,17 @@
 
           <!-- Search & Filter Bar -->
           <div class="flex items-center gap-2">
-            <input type="search" name="q" placeholder="Filter memories..."
+            <input type="search" name="q" id="memory-search-input" placeholder="Filter memories..."
               hx-get="/htmx/memory"
               hx-trigger="keyup changed delay:200ms, search"
               hx-target="#memory-list-container"
-              hx-include="[name='category_filter']"
+              hx-include="#memory-search-input, #category_filter"
               class="flex-1 px-3 py-1.5 rounded border border-[#d4d4ce] bg-white text-[12.5px]" />
             <select name="category" id="category_filter"
               hx-get="/htmx/memory"
               hx-trigger="change"
               hx-target="#memory-list-container"
+              hx-include="#memory-search-input, #category_filter"
               class="px-3 py-1.5 rounded border border-[#d4d4ce] bg-white text-[12.5px]">
               <option value="all">All Categories</option>
               <option value="summary">summary</option>
@@ -565,7 +610,7 @@
       </section>
 
       <!-- ================================================================= -->
-      <!-- TAB 5: TOOLS (12 MAC & WEB TOOLS)                                 -->
+      <!-- TAB 5: TOOLS (12 MAC & WEB TOOLS + WORKSPACE NOTES)               -->
       <!-- ================================================================= -->
       <section id="tab-tools" class="tab-panel hidden max-w-4xl flex flex-col gap-5">
         <form hx-post="/htmx/tools/toggle" hx-target="#tools-save-badge" hx-swap="innerHTML"
@@ -619,6 +664,11 @@
                 <div class="flex items-center gap-2">
                   <input type="text" name="args" id="tool-tester-args" value="{}"
                     class="flex-1 px-3 py-1.5 rounded border border-[#d4d4ce] bg-[#f9f9f7] font-mono text-[12.5px]" />
+                  <button type="button"
+                    onclick="const sel = document.getElementById('tool-tester-select'); const opt = sel.options[sel.selectedIndex]; document.getElementById('tool-tester-args').value = opt.getAttribute('data-sample') || '{}';"
+                    class="px-2.5 py-1.5 rounded border border-[#d4d4ce] bg-[#f9f9f7] hover:bg-white text-[12px] text-[#555550] cursor-pointer">
+                    Sample JSON
+                  </button>
                   <button type="submit" class="px-4 py-1.5 rounded bg-[#1a1a19] text-white text-[12.5px] font-medium cursor-pointer">
                     Run Tool
                   </button>
@@ -627,6 +677,45 @@
             </div>
           </form>
           <div id="tool-test-output"></div>
+        </div>
+
+        <!-- Workspace Notes Manager (notes/*.md created by write_project_note or user) -->
+        <div class="bg-white rounded-md border border-[#e4e4df] p-5 flex flex-col gap-4">
+          <div class="flex items-center justify-between">
+            <div>
+              <h3 class="text-[14px] font-semibold text-[#1a1a19]">Workspace Notes (notes/*.md)</h3>
+              <p class="text-[12px] text-[#666660]">Notes written by Gemini via <span class="font-mono">write_project_note</span> or created directly here.</p>
+            </div>
+            <button type="button"
+              hx-get="/htmx/notes"
+              hx-target="#notes-list-container"
+              hx-swap="innerHTML"
+              class="text-[11.5px] px-2.5 py-1 rounded border border-[#d4d4ce] bg-[#f9f9f7] cursor-pointer">
+              Refresh Notes
+            </button>
+          </div>
+
+          <form hx-post="/htmx/notes/save" hx-target="#notes-list-container" hx-swap="innerHTML"
+            hx-on::after-request="if(event.detail.successful) this.reset()"
+            class="p-3 rounded bg-[#f9f9f7] border border-[#e4e4df] flex flex-col gap-2.5">
+            <div class="flex items-center gap-2">
+              <input type="text" name="filename" required placeholder="note_name.md"
+                class="w-60 px-2.5 py-1.5 rounded border border-[#d4d4ce] bg-white font-mono text-[12px]" />
+              <select name="mode" class="px-2.5 py-1.5 rounded border border-[#d4d4ce] bg-white text-[12px]">
+                <option value="overwrite">Overwrite</option>
+                <option value="append">Append</option>
+              </select>
+              <button type="submit" class="ml-auto px-3.5 py-1.5 rounded bg-[#1a1a19] text-white text-[12px] font-medium cursor-pointer">
+                Save Note
+              </button>
+            </div>
+            <textarea name="content" rows="3" required placeholder="Markdown note content..."
+              class="w-full p-2.5 rounded border border-[#d4d4ce] bg-white font-mono text-[12px]"></textarea>
+          </form>
+
+          <div id="notes-list-container" class="flex flex-col gap-2.5">
+            {{notesListHTML}}
+          </div>
         </div>
       </section>
 

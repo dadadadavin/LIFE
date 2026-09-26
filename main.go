@@ -29,6 +29,9 @@ func initTemplates() error {
 		"keysListHTML": func(cfg AppConfig) template.HTML {
 			return template.HTML(renderKeysListHTML(cfg))
 		},
+		"notesListHTML": func() template.HTML {
+			return template.HTML(renderNotesListHTML())
+		},
 	}
 
 	tmplPath := filepath.Join(baseDir, "templates", "index.html")

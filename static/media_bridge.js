@@ -8,17 +8,24 @@
     barge_in_threshold: 3200,
     vision_resolution: 1080,
     mirror_camera: false,
+    push_to_talk: false,
+    speaker_volume: 100,
+    auto_reconnect: true,
   };
 
   let ws = null;
   let isConnected = false;
   let isMuted = false;
+  let isPttHolding = false;
+  let userInitiatedDisconnect = false;
+  let pingInterval = null;
 
   // Audio contexts & nodes
   let micCtx = null;
   let micStream = null;
   let micWorkletNode = null;
   let playCtx = null;
+  let playGainNode = null;
   let nextPlayTime = 0;
   let activeSources = [];
   let lastSpeakerEndTime = 0;
@@ -59,10 +66,28 @@
         if ($("vision-res-select") && appConfig.vision_resolution) {
           $("vision-res-select").value = String(appConfig.vision_resolution);
         }
+        if ($("studio-volume-slider") && appConfig.speaker_volume !== undefined) {
+          $("studio-volume-slider").value = String(appConfig.speaker_volume);
+          if ($("studio-volume-label")) $("studio-volume-label").textContent = `${appConfig.speaker_volume}%`;
+        }
+        if (playGainNode) {
+          playGainNode.gain.value = (appConfig.speaker_volume ?? 100) / 100.0;
+        }
+        updatePttButtonUI();
         isMirrored = !!appConfig.mirror_camera;
         applyMirrorStyle();
       }
     } catch (_) {}
+  }
+
+  function updatePttButtonUI() {
+    const btn = $("btn-ptt-mode");
+    if (!btn) return;
+    const ptt = !!appConfig.push_to_talk;
+    btn.textContent = ptt ? "PTT On (Hold V)" : "PTT Off (Open Mic)";
+    btn.className = ptt
+      ? "px-2 py-1 rounded border border-[#b8cee6] bg-[#e8f0f8] text-[#1f4b7a] font-medium text-[11px] cursor-pointer"
+      : "px-2 py-1 rounded border border-[#d4d4ce] bg-[#f9f9f7] text-[#555550] text-[11px] cursor-pointer";
   }
 
   document.body.addEventListener("configUpdated", () => {
@@ -106,6 +131,9 @@
     if (tabName === "memory" && window.htmx) {
       window.htmx.ajax("GET", "/htmx/memory", { target: "#memory-list-container", swap: "innerHTML" });
     }
+    if (tabName === "tools" && window.htmx) {
+      window.htmx.ajax("GET", "/htmx/notes", { target: "#notes-list-container", swap: "innerHTML" });
+    }
   }
 
   document.querySelectorAll(".nav-tab").forEach((btn) => {
@@ -140,11 +168,14 @@
   }
 
   // =========================================================================
-  // 4. Speaker Playback (24kHz 16-bit Mono PCM) & Interruption
+  // 4. Speaker Playback (24kHz 16-bit Mono PCM + GainNode Volume) & Interruption
   // =========================================================================
   function ensurePlayContext() {
     if (!playCtx || playCtx.state === "closed") {
       playCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+      playGainNode = playCtx.createGain();
+      playGainNode.gain.value = (appConfig.speaker_volume ?? 100) / 100.0;
+      playGainNode.connect(playCtx.destination);
       nextPlayTime = 0;
     }
     if (playCtx.state === "suspended") {
@@ -193,7 +224,7 @@
 
     const src = playCtx.createBufferSource();
     src.buffer = audioBuf;
-    src.connect(playCtx.destination);
+    src.connect(playGainNode || playCtx.destination);
 
     const now = playCtx.currentTime;
     if (nextPlayTime < now + 0.01) {
@@ -228,28 +259,37 @@
   }
 
   // =========================================================================
-  // 5. Microphone Capture (16kHz 16-bit Mono PCM) + Smart Voice Barge-In
+  // 5. Microphone Capture (Dynamic Resampling -> 16kHz PCM) + VAD Flushing
   // =========================================================================
+  // Update #1: Dynamically downsample from hardware sampleRate (48kHz / 44.1kHz / 16kHz)
+  // to 16,000 Hz 16-bit PCM so macOS Bluetooth/AirPods/Built-in mics always work cleanly.
   const WORKLET_CODE = `
     class LifelMicProcessor extends AudioWorkletProcessor {
       constructor() {
         super();
+        this.targetRate = 16000;
         this.buffer = new Int16Array(1600); // 100ms at 16kHz
         this.offset = 0;
+        this.resamplePos = 0.0;
       }
       process(inputs) {
         const input = inputs[0];
-        if (!input || !input[0]) return true;
+        if (!input || !input[0] || input[0].length === 0) return true;
         const chan = input[0];
-        for (let i = 0; i < chan.length; i++) {
-          const s = Math.max(-1, Math.min(1, chan[i]));
+        const ratio = sampleRate / this.targetRate;
+
+        while (this.resamplePos < chan.length) {
+          const idx = Math.floor(this.resamplePos);
+          const s = Math.max(-1, Math.min(1, chan[idx]));
           this.buffer[this.offset++] = s < 0 ? s * 0x8000 : s * 0x7FFF;
           if (this.offset >= this.buffer.length) {
             const copy = new Int16Array(this.buffer);
             this.port.postMessage(copy.buffer, [copy.buffer]);
             this.offset = 0;
           }
+          this.resamplePos += ratio;
         }
+        this.resamplePos -= chan.length;
         return true;
       }
     }
@@ -260,7 +300,6 @@
     const micDevId = $("select-mic-device")?.value;
     const audioConstraints = {
       channelCount: 1,
-      sampleRate: 16000,
       echoCancellation: true,
       noiseSuppression: true,
       autoGainControl: true,
@@ -270,7 +309,7 @@
     }
 
     micStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
-    micCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+    micCtx = new (window.AudioContext || window.webkitAudioContext)();
     const blob = new Blob([WORKLET_CODE], { type: "application/javascript" });
     const workletUrl = URL.createObjectURL(blob);
     await micCtx.audioWorklet.addModule(workletUrl);
@@ -278,6 +317,8 @@
 
     const source = micCtx.createMediaStreamSource(micStream);
     micWorkletNode = new AudioWorkletNode(micCtx, "lifel-mic-processor");
+
+    const silentFrame = new Int16Array(1600).buffer;
 
     micWorkletNode.port.onmessage = (ev) => {
       if (!isConnected || !ws || ws.readyState !== WebSocket.OPEN) return;
@@ -292,6 +333,18 @@
         sumSq += pcm16[i] * pcm16[i];
       }
       const rms = Math.round(Math.sqrt(sumSq / pcm16.length));
+
+      // Push-to-Talk Mode (Hold V)
+      if (appConfig.push_to_talk) {
+        if (isPttHolding) {
+          stopAllPlayback();
+          sendPcmBuffer(ev.data);
+          updateMicMeter(rms, "PTT Transmitting (Holding V)");
+        } else {
+          updateMicMeter(rms, "PTT Standby (Hold V to talk)");
+        }
+        return;
+      }
 
       const spkActive = isSpeakerPlaying();
       const inCooldown = performance.now() - lastSpeakerEndTime < 220;
@@ -319,13 +372,20 @@
 
       bargeInHotFrames = 0;
       if (rms >= gateRms) {
-        speechTailFrames = 5;
+        speechTailFrames = 6; // 600ms tail
         sendPcmBuffer(ev.data);
         updateMicMeter(rms, "Streaming Speech");
       } else if (speechTailFrames > 0) {
         speechTailFrames--;
+        // Send actual frame + zeroed silence when tail finishes so Server VAD commits immediately (Update #2)
         sendPcmBuffer(ev.data);
-        updateMicMeter(rms, "Speech Tail");
+        if (speechTailFrames === 0) {
+          sendPcmBuffer(silentFrame);
+          ws.send(JSON.stringify({ type: "audio_stream_end" }));
+          updateMicMeter(rms, "Speech Committed (VAD)");
+        } else {
+          updateMicMeter(rms, "Speech Tail");
+        }
       } else {
         updateMicMeter(rms, "Below Noise Gate");
       }
@@ -371,7 +431,7 @@
   }
 
   // =========================================================================
-  // 6. Vision Input (Webcam / Screen Share / High-Res Snapshot)
+  // 6. Vision Input (Webcam / Screen / HD Snapshot / Image & File Upload)
   // =========================================================================
   function getTargetMaxDim() {
     const sel = parseInt($("vision-res-select")?.value || appConfig.vision_resolution || "1080", 10);
@@ -499,6 +559,69 @@
     if (ph) ph.classList.remove("hidden");
     if ($("vision-status-label")) $("vision-status-label").textContent = "No active video stream";
     if ($("btn-snap-hd")) $("btn-snap-hd").disabled = true;
+  }
+
+  // Update #11: Upload or Drag-and-Drop Image or Text File into Live Session
+  async function handleUploadedFile(file) {
+    if (!file) return;
+    if (!isConnected || !ws || ws.readyState !== WebSocket.OPEN) {
+      appendSystemNotice("Start a Live Session first to upload an image or file to Gemini.", true);
+      return;
+    }
+
+    if (file.type.startsWith("image/")) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const img = new Image();
+        img.onload = () => {
+          const canvas = $("vision-canvas") || document.createElement("canvas");
+          const maxDim = 1280;
+          let w = img.width;
+          let h = img.height;
+          if (w > maxDim || h > maxDim) {
+            if (w >= h) {
+              h = Math.round((h * maxDim) / w);
+              w = maxDim;
+            } else {
+              w = Math.round((w * maxDim) / h);
+              h = maxDim;
+            }
+          }
+          canvas.width = w;
+          canvas.height = h;
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(img, 0, 0, w, h);
+          const dataUrl = canvas.toDataURL("image/jpeg", 0.92);
+          const b64 = dataUrl.split(",")[1];
+          if (b64) {
+            ws.send(JSON.stringify({ type: "image", data: b64, mime_type: "image/jpeg" }));
+            ws.send(
+              JSON.stringify({
+                type: "text",
+                text: `[Uploaded image: ${file.name} (${w}x${h})]. Please inspect this image and let me know what you see.`,
+              })
+            );
+            if ($("vision-status-label")) {
+              $("vision-status-label").textContent = `Uploaded ${file.name} (${w}x${h})`;
+            }
+          }
+        };
+        img.src = reader.result;
+      };
+      reader.readAsDataURL(file);
+    } else {
+      const text = await file.text();
+      const clipped = text.length > 12000 ? text.slice(0, 12000) + "\n...[truncated]" : text;
+      ws.send(
+        JSON.stringify({
+          type: "text",
+          text: `[Uploaded file: ${file.name}]\n\`\`\`\n${clipped}\n\`\`\`\nPlease review this file.`,
+        })
+      );
+      if ($("vision-status-label")) {
+        $("vision-status-label").textContent = `Uploaded text file: ${file.name}`;
+      }
+    }
   }
 
   // =========================================================================
@@ -636,14 +759,16 @@
   }
 
   // =========================================================================
-  // 8. Live WebSocket Session Lifecycle
+  // 8. Live WebSocket Session Lifecycle + Ping/Pong RTT + Auto-Reconnect
   // =========================================================================
   async function connectLiveSession() {
     if (isConnected) {
+      userInitiatedDisconnect = true;
       disconnectLiveSession();
       return;
     }
 
+    userInitiatedDisconnect = false;
     await syncStateFromServer();
     ensurePlayContext();
 
@@ -664,6 +789,12 @@
 
     ws.onopen = () => {
       if ($("live-status-text")) $("live-status-text").textContent = "Handshaking with Gemini Live API...";
+      if (pingInterval) clearInterval(pingInterval);
+      pingInterval = setInterval(() => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "ping", ts: Date.now() }));
+        }
+      }, 5000);
     };
 
     ws.onmessage = (ev) => {
@@ -697,10 +828,41 @@
             $("live-status-text").textContent = `Connected (${msg.model}, voice: ${msg.voice}, key: ${msg.key_name})`;
           }
           appendSystemNotice(`Connected to ${msg.model} (voice: ${msg.voice}, key: ${msg.key_name})`);
+          // Trigger initial RTT ping
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "ping", ts: Date.now() }));
+          }
+          break;
+
+        case "pong":
+          if (msg.ts && $("sidebar-rtt-label")) {
+            const rtt = Math.max(1, Date.now() - Number(msg.ts));
+            $("sidebar-rtt-label").textContent = `${rtt}ms`;
+          }
+          break;
+
+        case "usage":
+          if (msg.total_tokens && $("live-tokens-badge")) {
+            $("live-tokens-badge").textContent = `Tokens: ${msg.total_tokens}`;
+            $("live-tokens-badge").classList.remove("hidden");
+          }
+          break;
+
+        case "memory_updated":
+          if (window.htmx && $("memory-list-container")) {
+            window.htmx.ajax("GET", "/htmx/memory", { target: "#memory-list-container", swap: "innerHTML" });
+          }
+          break;
+
+        case "notes_updated":
+          if (window.htmx && $("notes-list-container")) {
+            window.htmx.ajax("GET", "/htmx/notes", { target: "#notes-list-container", swap: "innerHTML" });
+          }
           break;
 
         case "input_tx":
-          updateOrCreateBubble("user", msg.full || msg.text, !!msg.final);
+          // Update #3: Keep accumulating within the current turn bubble; only finalize on turn_complete
+          updateOrCreateBubble("user", msg.full || msg.text, false);
           break;
 
         case "user_text_committed":
@@ -709,7 +871,8 @@
           break;
 
         case "output_tx":
-          updateOrCreateBubble("gemini", msg.full || msg.text, !!msg.final);
+          // Update #3: Keep accumulating within the current turn bubble; only finalize on turn_complete/interrupted
+          updateOrCreateBubble("gemini", msg.full || msg.text, false);
           break;
 
         case "audio":
@@ -731,7 +894,7 @@
               currentModelBubble.latencySpan.classList.remove("hidden");
             }
             if ($("last-latency-badge")) {
-              $("last-latency-badge").textContent = `Latency: ${msg.latency_ms}ms`;
+              $("last-latency-badge").textContent = `Turn: ${msg.latency_ms}ms`;
               $("last-latency-badge").classList.remove("hidden");
             }
           }
@@ -760,7 +923,16 @@
     };
 
     ws.onclose = () => {
+      const unexpectedDrop = isConnected && !userInitiatedDisconnect;
       cleanupSessionUI();
+      if (unexpectedDrop && appConfig.auto_reconnect !== false) {
+        appendSystemNotice("Connection dropped unexpectedly. Auto-reconnecting in 2 seconds...");
+        setTimeout(() => {
+          if (!isConnected && !userInitiatedDisconnect) {
+            connectLiveSession();
+          }
+        }, 2000);
+      }
     };
 
     ws.onerror = () => {
@@ -769,6 +941,7 @@
   }
 
   function disconnectLiveSession() {
+    userInitiatedDisconnect = true;
     if (ws) {
       try {
         ws.send(JSON.stringify({ type: "disconnect" }));
@@ -783,8 +956,15 @@
     const wasConnected = isConnected;
     isConnected = false;
     isMuted = false;
+    isPttHolding = false;
     currentUserBubble = null;
     currentModelBubble = null;
+
+    if (pingInterval) {
+      clearInterval(pingInterval);
+      pingInterval = null;
+    }
+    if ($("sidebar-rtt-label")) $("sidebar-rtt-label").textContent = "--";
 
     stopMicrophone();
     stopAllPlayback();
@@ -798,6 +978,7 @@
     if ($("btn-mute")) {
       $("btn-mute").disabled = true;
       $("btn-mute").textContent = "Mute Mic (M)";
+      $("btn-mute").className = "px-2.5 py-1 rounded border border-[#d4d4ce] bg-[#f9f9f7] text-[#1a1a19] text-[11.5px] disabled:opacity-40 cursor-pointer";
     }
     if ($("btn-interrupt")) $("btn-interrupt").disabled = true;
     if ($("sidebar-conn-badge")) {
@@ -813,7 +994,7 @@
   }
 
   // =========================================================================
-  // 9. UI Controls & Keyboard Shortcuts
+  // 9. UI Controls, Drag-and-Drop, Quick Chips & Keyboard Shortcuts
   // =========================================================================
   function toggleMute() {
     if (!isConnected) return;
@@ -834,6 +1015,83 @@
   $("btn-mute")?.addEventListener("click", toggleMute);
   $("btn-interrupt")?.addEventListener("click", () => {
     stopAllPlayback();
+  });
+
+  // Push-to-Talk Mode Toggle (Update #13)
+  $("btn-ptt-mode")?.addEventListener("click", () => {
+    appConfig.push_to_talk = !appConfig.push_to_talk;
+    updatePttButtonUI();
+    fetch("/api/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ push_to_talk: appConfig.push_to_talk }),
+    });
+  });
+
+  // Speaker Volume GainNode Slider (Update #13)
+  $("studio-volume-slider")?.addEventListener("input", (ev) => {
+    const vol = parseInt(ev.target.value, 10) || 0;
+    appConfig.speaker_volume = vol;
+    if ($("studio-volume-label")) $("studio-volume-label").textContent = `${vol}%`;
+    if (playGainNode) {
+      playGainNode.gain.value = vol / 100.0;
+    }
+  });
+  $("studio-volume-slider")?.addEventListener("change", (ev) => {
+    const vol = parseInt(ev.target.value, 10) || 0;
+    fetch("/api/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ speaker_volume: vol }),
+    });
+  });
+
+  // File / Image Upload & Drag-and-Drop (Update #11)
+  $("btn-upload-file")?.addEventListener("click", () => {
+    $("studio-file-upload")?.click();
+  });
+  $("studio-file-upload")?.addEventListener("change", (ev) => {
+    const file = ev.target.files?.[0];
+    if (file) {
+      handleUploadedFile(file);
+      ev.target.value = "";
+    }
+  });
+
+  const dropzone = $("vision-dropzone");
+  if (dropzone) {
+    dropzone.addEventListener("dragover", (ev) => {
+      ev.preventDefault();
+      dropzone.classList.add("border-[#1f4b7a]");
+    });
+    dropzone.addEventListener("dragleave", () => {
+      dropzone.classList.remove("border-[#1f4b7a]");
+    });
+    dropzone.addEventListener("drop", (ev) => {
+      ev.preventDefault();
+      dropzone.classList.remove("border-[#1f4b7a]");
+      const file = ev.dataTransfer?.files?.[0];
+      if (file) handleUploadedFile(file);
+    });
+  }
+
+  // Quick Prompt Starter Chips (Update #14)
+  document.querySelectorAll(".quick-prompt-chip").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      const prompt = chip.getAttribute("data-prompt");
+      if (!prompt) return;
+      if (!isConnected || !ws || ws.readyState !== WebSocket.OPEN) {
+        const inp = $("text-chat-input");
+        if (inp) {
+          inp.value = prompt;
+          inp.focus();
+        }
+        appendSystemNotice("Prompt placed in chat box. Click Start Live Session to send.", false);
+        return;
+      }
+      stopAllPlayback();
+      ws.send(JSON.stringify({ type: "text", text: prompt }));
+    });
   });
 
   $("btn-webcam")?.addEventListener("click", () => {
@@ -909,13 +1167,17 @@
     inp.value = "";
   });
 
-  // Global Keyboard Shortcuts (Space = Interrupt, M = Mute)
+  // Global Keyboard Shortcuts (Space = Interrupt, M = Mute, Hold V = Push-to-Talk)
   window.addEventListener("keydown", (ev) => {
-    if (appConfig.voice_barge_in === false) return;
     const tag = (ev.target?.tagName || "").toLowerCase();
     if (tag === "input" || tag === "textarea" || tag === "select" || ev.target?.isContentEditable) {
       return;
     }
+    if (ev.code === "KeyV" && isConnected && appConfig.push_to_talk && !ev.metaKey && !ev.ctrlKey) {
+      isPttHolding = true;
+      return;
+    }
+    if (appConfig.voice_barge_in === false) return;
     if (ev.code === "Space" && isConnected) {
       ev.preventDefault();
       stopAllPlayback();
@@ -924,6 +1186,26 @@
       toggleMute();
     }
   });
+
+  window.addEventListener("keyup", (ev) => {
+    const tag = (ev.target?.tagName || "").toLowerCase();
+    if (tag === "input" || tag === "textarea" || tag === "select" || ev.target?.isContentEditable) {
+      return;
+    }
+    if (ev.code === "KeyV" && isPttHolding) {
+      isPttHolding = false;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "audio_stream_end" }));
+      }
+    }
+  });
+
+  // Initialize Tool Tester default sample args on load (Update #10b)
+  const toolSelect = $("tool-tester-select");
+  const toolArgsInput = $("tool-tester-args");
+  if (toolSelect && toolArgsInput && toolSelect.options.length > 0) {
+    toolArgsInput.value = toolSelect.options[0].getAttribute("data-sample") || "{}";
+  }
 
   // Initialize on page load
   syncStateFromServer();

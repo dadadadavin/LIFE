@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"html"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -25,6 +27,7 @@ type PageData struct {
 	Tools    []ToolView
 	Sessions []SessionSummaryItem
 	Keys     []KeyInfo
+	Notes    []NoteItem
 }
 
 func buildToolViews(cfg AppConfig) []ToolView {
@@ -51,6 +54,7 @@ func buildPageData() PageData {
 		Tools:    buildToolViews(cfg),
 		Sessions: listSessionSummaries(),
 		Keys:     listKeyInfos(cfg),
+		Notes:    listNotes(),
 	}
 }
 
@@ -284,9 +288,17 @@ func renderSessionDetailHTML(sessionID string) string {
 		<div class="flex items-center justify-between border-b border-[#e4e4df] pb-3 flex-wrap gap-2">
 			<div>
 				<h3 class="text-[15px] font-semibold text-[#1a1a19] font-mono">Session %s</h3>
-				<p class="text-[12px] text-[#666660]">Model: %s · Voice: %s · Key: %s · Turns: %d · Duration: %.1fs</p>
+				<p class="text-[12px] text-[#666660]">Model: %s · Voice: %s · Key: %s · Turns: %d · Duration: %.1fs · Tokens: %d</p>
 			</div>
-			<div class="flex items-center gap-2">
+			<div class="flex items-center gap-2 flex-wrap">
+				<a href="/api/sessions/%s/export?format=md" download="session_%s.md"
+					class="px-2.5 py-1.5 text-[12px] rounded border border-[#d4d4ce] bg-[#f9f9f7] hover:bg-[#f0f0ec] text-[#1a1a19]">
+					Export .md
+				</a>
+				<a href="/api/sessions/%s/export?format=json" download="session_%s.json"
+					class="px-2.5 py-1.5 text-[12px] rounded border border-[#d4d4ce] bg-[#f9f9f7] hover:bg-[#f0f0ec] text-[#1a1a19]">
+					Export .json
+				</a>
 				<button type="button"
 					hx-post="/htmx/sessions/%s/resume"
 					hx-target="#resume-banner-slot"
@@ -302,6 +314,11 @@ func renderSessionDetailHTML(sessionID string) string {
 		html.EscapeString(rec.KeyName),
 		len(rec.Turns),
 		rec.DurationSec,
+		rec.Usage.TotalTokens,
+		html.EscapeString(rec.ID),
+		html.EscapeString(rec.ID),
+		html.EscapeString(rec.ID),
+		html.EscapeString(rec.ID),
 		html.EscapeString(rec.ID),
 	))
 
@@ -351,6 +368,47 @@ func renderSessionDetailHTML(sessionID string) string {
 		}
 	}
 	sb.WriteString(`</div></div>`)
+	return sb.String()
+}
+
+func renderNotesListHTML() string {
+	notes := listNotes()
+	if len(notes) == 0 {
+		return `<div class="p-4 text-[12.5px] text-[#666660] bg-[#f9f9f7] rounded border border-[#e4e4df]">No markdown notes in notes/ yet. Create one above or ask Gemini to write a project note.</div>`
+	}
+	var sb strings.Builder
+	for _, n := range notes {
+		sb.WriteString(fmt.Sprintf(`
+		<details class="rounded-md border border-[#e4e4df] bg-white p-3.5 text-[12.5px]">
+			<summary class="cursor-pointer flex items-center justify-between gap-2 font-medium text-[#1a1a19]">
+				<span class="font-mono text-[13px] font-semibold">%s</span>
+				<span class="text-[11px] text-[#666660] font-mono">%s · %d bytes</span>
+			</summary>
+			<form hx-post="/htmx/notes/save" hx-target="#notes-list-container" hx-swap="innerHTML" class="mt-3 flex flex-col gap-2">
+				<input type="hidden" name="name" value="%s" />
+				<textarea name="content" rows="6" class="w-full p-2.5 rounded border border-[#d4d4ce] bg-[#f9f9f7] focus:bg-white font-mono text-[12px] text-[#1a1a19]">%s</textarea>
+				<div class="flex items-center justify-between">
+					<button type="button"
+						hx-delete="/htmx/notes/%s"
+						hx-target="#notes-list-container"
+						hx-swap="innerHTML"
+						class="px-2.5 py-1 rounded border border-[#f2cbc6] bg-[#fae8e6] text-[#8a261d] text-[11.5px] cursor-pointer">
+						Delete Note
+					</button>
+					<button type="submit" class="px-3 py-1 rounded bg-[#1a1a19] text-white text-[12px] font-medium cursor-pointer">
+						Save Changes
+					</button>
+				</div>
+			</form>
+		</details>`,
+			html.EscapeString(n.Name),
+			html.EscapeString(n.UpdatedAt),
+			n.SizeBytes,
+			html.EscapeString(n.Name),
+			html.EscapeString(n.Content),
+			html.EscapeString(n.Name),
+		))
+	}
 	return sb.String()
 }
 
@@ -471,12 +529,13 @@ func registerRoutes(mux *http.ServeMux) {
 					updates[key] = f
 				}
 			case "prefix_padding_ms", "silence_duration_ms", "trigger_tokens", "target_tokens",
-				"barge_in_threshold", "vision_resolution":
+				"barge_in_threshold", "vision_resolution", "speaker_volume":
 				if n, err := strconv.Atoi(val); err == nil {
 					updates[key] = n
 				}
 			case "proactive_audio", "echo_shield", "voice_barge_in", "auto_extract_memory",
-				"mirror_camera", "auto_key_failover", "inject_memory":
+				"mirror_camera", "auto_key_failover", "inject_memory", "push_to_talk",
+				"auto_reconnect", "continue_last_session":
 				updates[key] = (val == "true" || val == "on" || val == "1")
 			}
 		}
@@ -574,6 +633,7 @@ func registerRoutes(mux *http.ServeMux) {
 			}
 		}
 		res := executeLocalTool(name, argsMap)
+		delete(res, "_native_screen_b64")
 		pretty, _ := json.MarshalIndent(res, "", "  ")
 		writeHTML(w, fmt.Sprintf(`<pre class="p-3 rounded bg-white border border-[#e4e4df] text-[#1a1a19] text-[12px] font-mono overflow-x-auto max-h-[320px]">%s</pre>`, html.EscapeString(string(pretty))))
 	})
@@ -602,6 +662,37 @@ func registerRoutes(mux *http.ServeMux) {
 		id := r.PathValue("id")
 		deleteSessionRecord(id)
 		writeHTML(w, renderSessionsListHTML())
+	})
+
+	mux.HandleFunc("GET /htmx/notes", func(w http.ResponseWriter, r *http.Request) {
+		writeHTML(w, renderNotesListHTML())
+	})
+
+	mux.HandleFunc("POST /htmx/notes/save", func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		name := strings.TrimSpace(r.FormValue("name"))
+		if name == "" {
+			name = strings.TrimSpace(r.FormValue("filename"))
+		}
+		content := r.FormValue("content")
+		mode := strings.TrimSpace(r.FormValue("mode"))
+		if name != "" {
+			if mode == "append" {
+				_, _ = executeLocalTool("write_project_note", map[string]any{
+					"title":   name,
+					"content": content,
+					"mode":    "append",
+				})["ok"].(bool)
+			} else {
+				_ = saveNote(name, content)
+			}
+		}
+		writeHTML(w, renderNotesListHTML())
+	})
+
+	mux.HandleFunc("DELETE /htmx/notes/{name}", func(w http.ResponseWriter, r *http.Request) {
+		deleteNote(r.PathValue("name"))
+		writeHTML(w, renderNotesListHTML())
 	})
 
 	mux.HandleFunc("GET /htmx/keys", func(w http.ResponseWriter, r *http.Request) {
@@ -664,6 +755,7 @@ func registerRoutes(mux *http.ServeMux) {
 			"tools":    buildToolViews(cfg),
 			"keys":     listKeyInfos(cfg),
 			"sessions": listSessionSummaries(),
+			"notes":    listNotes(),
 		})
 	})
 
@@ -740,6 +832,7 @@ func registerRoutes(mux *http.ServeMux) {
 			return
 		}
 		res := executeLocalTool(body.Name, body.Args)
+		delete(res, "_native_screen_b64")
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "result": res})
 	})
 
@@ -756,9 +849,37 @@ func registerRoutes(mux *http.ServeMux) {
 		writeJSON(w, http.StatusOK, rec)
 	})
 
+	mux.HandleFunc("GET /api/sessions/{id}/export", func(w http.ResponseWriter, r *http.Request) {
+		cleanID := filepath.Base(r.PathValue("id"))
+		format := strings.ToLower(r.URL.Query().Get("format"))
+		if format == "md" {
+			data, err := os.ReadFile(filepath.Join(sessionsDir, cleanID+".md"))
+			if err != nil {
+				http.Error(w, "Markdown transcript not found", http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"session_%s.md\"", cleanID))
+			_, _ = w.Write(data)
+			return
+		}
+		data, err := os.ReadFile(filepath.Join(sessionsDir, cleanID+".json"))
+		if err != nil {
+			http.Error(w, "JSON transcript not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"session_%s.json\"", cleanID))
+		_, _ = w.Write(data)
+	})
+
 	mux.HandleFunc("DELETE /api/sessions/{id}", func(w http.ResponseWriter, r *http.Request) {
 		deleteSessionRecord(r.PathValue("id"))
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "sessions": listSessionSummaries()})
+	})
+
+	mux.HandleFunc("GET /api/notes", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"notes": listNotes()})
 	})
 
 	mux.HandleFunc("POST /api/keys/test/{name}", func(w http.ResponseWriter, r *http.Request) {

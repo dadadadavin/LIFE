@@ -189,6 +189,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 	var logMu sync.Mutex
 	var turnsLog []TurnEntry
 	var latestResumptionHandle string
+	var latestUsage UsageStats
 
 	var turnMu sync.Mutex
 	var userTextBuf []string
@@ -309,7 +310,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 				})
 
 			case "ping":
-				_ = safeSend(map[string]any{"type": "pong"})
+				_ = safeSend(map[string]any{"type": "pong", "ts": msg["ts"]})
 
 			case "disconnect":
 				return
@@ -335,14 +336,34 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			// Session resumption token update
+			// Update #5: Persist Session Resumption Handle to config.json
 			if resp.SessionResumptionUpdate != nil && resp.SessionResumptionUpdate.NewHandle != "" {
+				newHandle := resp.SessionResumptionUpdate.NewHandle
 				logMu.Lock()
-				latestResumptionHandle = resp.SessionResumptionUpdate.NewHandle
+				latestResumptionHandle = newHandle
 				logMu.Unlock()
+				_ = saveConfigMap(map[string]any{"last_resumption_handle": newHandle})
 				_ = safeSend(map[string]any{
 					"type":   "resumption_update",
-					"handle": resp.SessionResumptionUpdate.NewHandle,
+					"handle": newHandle,
+				})
+			}
+
+			// Update #6: Capture & Broadcast Real-Time Token UsageMetadata
+			if resp.UsageMetadata != nil && resp.UsageMetadata.TotalTokenCount > 0 {
+				u := UsageStats{
+					PromptTokens:   resp.UsageMetadata.PromptTokenCount,
+					ResponseTokens: resp.UsageMetadata.ResponseTokenCount,
+					TotalTokens:    resp.UsageMetadata.TotalTokenCount,
+				}
+				logMu.Lock()
+				latestUsage = u
+				logMu.Unlock()
+				_ = safeSend(map[string]any{
+					"type":            "usage",
+					"prompt_tokens":   u.PromptTokens,
+					"response_tokens": u.ResponseTokens,
+					"total_tokens":    u.TotalTokens,
 				})
 			}
 
@@ -368,19 +389,11 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 				// 2. Output Audio Transcription (Gemini spoken words)
 				if sc.OutputTranscription != nil && sc.OutputTranscription.Text != "" {
 					tx := sc.OutputTranscription.Text
+					var flushedUser string
 					turnMu.Lock()
 					if len(userTextBuf) > 0 {
-						flushedUser := strings.TrimSpace(strings.Join(userTextBuf, ""))
+						flushedUser = strings.TrimSpace(strings.Join(userTextBuf, ""))
 						userTextBuf = nil
-						if flushedUser != "" {
-							logMu.Lock()
-							turnsLog = append(turnsLog, TurnEntry{
-								Role: "user",
-								Text: flushedUser,
-								Time: time.Now().Format("15:04:05"),
-							})
-							logMu.Unlock()
-						}
 					}
 					if turnFirstByteLatencyMs == 0 && !lastUserActivity.IsZero() {
 						turnFirstByteLatencyMs = time.Since(lastUserActivity).Milliseconds()
@@ -388,6 +401,17 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 					modelTextBuf = append(modelTextBuf, tx)
 					fullModel := strings.TrimSpace(strings.Join(modelTextBuf, ""))
 					turnMu.Unlock()
+
+					// Update #4: Acquire logMu only AFTER releasing turnMu (no nested locks)
+					if flushedUser != "" {
+						logMu.Lock()
+						turnsLog = append(turnsLog, TurnEntry{
+							Role: "user",
+							Text: flushedUser,
+							Time: time.Now().Format("15:04:05"),
+						})
+						logMu.Unlock()
+					}
 
 					_ = safeSend(map[string]any{
 						"type":  "output_tx",
@@ -489,9 +513,29 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 
 					resultData := executeLocalTool(fc.Name, argsMap)
 
-					// Check if capture_mac_screen requested an immediate browser HD frame
+					// Update #10: Handle browser HD frame request & native macOS screen JPEG injection
 					if reqFrame, ok := resultData["_request_browser_hd_frame"].(bool); ok && reqFrame {
+						delete(resultData, "_request_browser_hd_frame")
 						_ = safeSend(map[string]any{"type": "request_hd_frame"})
+					}
+					if nativeB64, ok := resultData["_native_screen_b64"].(string); ok && nativeB64 != "" {
+						delete(resultData, "_native_screen_b64")
+						if jpegBytes, err := base64.StdEncoding.DecodeString(nativeB64); err == nil && len(jpegBytes) > 0 {
+							_ = session.SendRealtimeInput(genai.LiveRealtimeInput{
+								Video: &genai.Blob{
+									Data:     jpegBytes,
+									MIMEType: "image/jpeg",
+								},
+							})
+						}
+					}
+
+					// Update #7: Notify browser UI when memory or notes are updated via voice tool
+					if fc.Name == "save_user_memory" {
+						_ = safeSend(map[string]any{"type": "memory_updated"})
+					}
+					if fc.Name == "write_project_note" {
+						_ = safeSend(map[string]any{"type": "notes_updated"})
 					}
 
 					nowStr := time.Now().Format("15:04:05")
@@ -555,6 +599,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	finalTurns := append([]TurnEntry(nil), turnsLog...)
 	resHandle := latestResumptionHandle
+	finalUsage := latestUsage
 	logMu.Unlock()
 
 	if len(finalTurns) > 0 {
@@ -566,6 +611,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 			Voice:            cfg.VoiceName,
 			KeyName:          connectedKeyName,
 			ResumptionHandle: resHandle,
+			Usage:            finalUsage,
 			Turns:            finalTurns,
 		})
 	}
