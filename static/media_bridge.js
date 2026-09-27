@@ -5,9 +5,13 @@
     voice_name: "Puck",
     echo_shield: true,
     voice_barge_in: true,
+    noise_gate_rms: 850,
     barge_in_threshold: 3200,
     vision_resolution: 1080,
     mirror_camera: false,
+    browser_echo_cancellation: true,
+    browser_noise_suppression: true,
+    browser_auto_gain: false,
     push_to_talk: false,
     speaker_volume: 100,
     auto_reconnect: true,
@@ -30,6 +34,7 @@
   let activeSources = [];
   let lastSpeakerEndTime = 0;
   let speechTailFrames = 0;
+  let silenceFlushFrames = 0;
   let bargeInHotFrames = 0;
 
   // Vision state
@@ -65,6 +70,10 @@
         }
         if ($("vision-res-select") && appConfig.vision_resolution) {
           $("vision-res-select").value = String(appConfig.vision_resolution);
+        }
+        if ($("studio-gate-slider") && appConfig.noise_gate_rms !== undefined) {
+          $("studio-gate-slider").value = String(appConfig.noise_gate_rms);
+          if ($("studio-gate-label")) $("studio-gate-label").textContent = String(appConfig.noise_gate_rms);
         }
         if ($("studio-volume-slider") && appConfig.speaker_volume !== undefined) {
           $("studio-volume-slider").value = String(appConfig.speaker_volume);
@@ -259,16 +268,14 @@
   }
 
   // =========================================================================
-  // 5. Microphone Capture (Dynamic Resampling -> 16kHz PCM) + VAD Flushing
+  // 5. Microphone Capture (50ms 16kHz PCM + 850 RMS Gate + Zero-Silence VAD Flush)
   // =========================================================================
-  // Update #1: Dynamically downsample from hardware sampleRate (48kHz / 44.1kHz / 16kHz)
-  // to 16,000 Hz 16-bit PCM so macOS Bluetooth/AirPods/Built-in mics always work cleanly.
   const WORKLET_CODE = `
     class LifelMicProcessor extends AudioWorkletProcessor {
       constructor() {
         super();
         this.targetRate = 16000;
-        this.buffer = new Int16Array(1600); // 100ms at 16kHz
+        this.buffer = new Int16Array(800); // 50ms at 16kHz (20 fps low-latency chunks)
         this.offset = 0;
         this.resamplePos = 0.0;
       }
@@ -300,9 +307,9 @@
     const micDevId = $("select-mic-device")?.value;
     const audioConstraints = {
       channelCount: 1,
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
+      echoCancellation: appConfig.browser_echo_cancellation !== false,
+      noiseSuppression: appConfig.browser_noise_suppression !== false,
+      autoGainControl: !!appConfig.browser_auto_gain,
     };
     if (micDevId) {
       audioConstraints.deviceId = { exact: micDevId };
@@ -318,11 +325,12 @@
     const source = micCtx.createMediaStreamSource(micStream);
     micWorkletNode = new AudioWorkletNode(micCtx, "lifel-mic-processor");
 
-    const silentFrame = new Int16Array(1600).buffer;
+    const silentFrame = new Int16Array(800).buffer;
 
     micWorkletNode.port.onmessage = (ev) => {
       if (!isConnected || !ws || ws.readyState !== WebSocket.OPEN) return;
       if (isMuted) {
+        sendPcmBuffer(silentFrame, true);
         updateMicMeter(0, "Muted");
         return;
       }
@@ -338,9 +346,10 @@
       if (appConfig.push_to_talk) {
         if (isPttHolding) {
           stopAllPlayback();
-          sendPcmBuffer(ev.data);
+          sendPcmBuffer(ev.data, false);
           updateMicMeter(rms, "PTT Transmitting (Holding V)");
         } else {
+          sendPcmBuffer(silentFrame, true);
           updateMicMeter(rms, "PTT Standby (Hold V to talk)");
         }
         return;
@@ -348,7 +357,7 @@
 
       const spkActive = isSpeakerPlaying();
       const inCooldown = performance.now() - lastSpeakerEndTime < 220;
-      const gateRms = 420;
+      const gateRms = Number(appConfig.noise_gate_rms ?? 850);
       const bargeRms = Number(appConfig.barge_in_threshold ?? 3200);
 
       // Smart Echo Shield + Loud Voice Barge-In
@@ -358,36 +367,34 @@
           if (bargeInHotFrames >= 2) {
             stopAllPlayback();
             bargeInHotFrames = 0;
-            speechTailFrames = 6;
-            sendPcmBuffer(ev.data);
+            speechTailFrames = 5;
+            sendPcmBuffer(ev.data, false);
             updateMicMeter(rms, "Barge-In Triggered");
             return;
           }
         } else {
           bargeInHotFrames = 0;
         }
+        // Stream pure digital zeros while speaker is active so VAD clock stays live without echo
+        sendPcmBuffer(silentFrame, true);
         updateMicMeter(rms, "Echo Shield Active");
         return;
       }
 
       bargeInHotFrames = 0;
       if (rms >= gateRms) {
-        speechTailFrames = 6; // 600ms tail
-        sendPcmBuffer(ev.data);
+        speechTailFrames = 5; // 250ms natural voice tail so word endings are never clipped
+        sendPcmBuffer(ev.data, false);
         updateMicMeter(rms, "Streaming Speech");
       } else if (speechTailFrames > 0) {
         speechTailFrames--;
-        // Send actual frame + zeroed silence when tail finishes so Server VAD commits immediately (Update #2)
-        sendPcmBuffer(ev.data);
-        if (speechTailFrames === 0) {
-          sendPcmBuffer(silentFrame);
-          ws.send(JSON.stringify({ type: "audio_stream_end" }));
-          updateMicMeter(rms, "Speech Committed (VAD)");
-        } else {
-          updateMicMeter(rms, "Speech Tail");
-        }
+        sendPcmBuffer(ev.data, false);
+        updateMicMeter(rms, "Speech Tail");
       } else {
-        updateMicMeter(rms, "Below Noise Gate");
+        // Stream pure digital zeros continuously when below noise gate so Server VAD
+        // clock advances in real time and fires end-of-speech within ~300ms
+        sendPcmBuffer(silentFrame, true);
+        updateMicMeter(rms, `Gate Closed (< ${gateRms})`);
       }
     };
 
@@ -395,14 +402,14 @@
     populateHardwareDevices();
   }
 
-  function sendPcmBuffer(arrayBuf) {
+  function sendPcmBuffer(arrayBuf, isSilent = false) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     const bytes = new Uint8Array(arrayBuf);
     let binary = "";
     for (let i = 0; i < bytes.byteLength; i++) {
       binary += String.fromCharCode(bytes[i]);
     }
-    ws.send(JSON.stringify({ type: "audio", data: btoa(binary) }));
+    ws.send(JSON.stringify({ type: "audio", data: btoa(binary), silent: isSilent }));
   }
 
   function updateMicMeter(rms, statusText) {
@@ -1006,9 +1013,6 @@
         ? "px-2.5 py-1 rounded border border-[#f2cbc6] bg-[#fae8e6] text-[#8a261d] text-[11.5px] font-medium cursor-pointer"
         : "px-2.5 py-1 rounded border border-[#d4d4ce] bg-[#f9f9f7] text-[#1a1a19] text-[11.5px] cursor-pointer";
     }
-    if (isMuted && ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "audio_stream_end" }));
-    }
   }
 
   $("btn-connect")?.addEventListener("click", connectLiveSession);
@@ -1025,6 +1029,21 @@
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ push_to_talk: appConfig.push_to_talk }),
+    });
+  });
+
+  // Mic Noise Gate RMS Slider
+  $("studio-gate-slider")?.addEventListener("input", (ev) => {
+    const gate = parseInt(ev.target.value, 10) || 850;
+    appConfig.noise_gate_rms = gate;
+    if ($("studio-gate-label")) $("studio-gate-label").textContent = String(gate);
+  });
+  $("studio-gate-slider")?.addEventListener("change", (ev) => {
+    const gate = parseInt(ev.target.value, 10) || 850;
+    fetch("/api/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ noise_gate_rms: gate }),
     });
   });
 
@@ -1194,9 +1213,6 @@
     }
     if (ev.code === "KeyV" && isPttHolding) {
       isPttHolding = false;
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "audio_stream_end" }));
-      }
     }
   });
 

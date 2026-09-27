@@ -529,13 +529,14 @@ func registerRoutes(mux *http.ServeMux) {
 					updates[key] = f
 				}
 			case "prefix_padding_ms", "silence_duration_ms", "trigger_tokens", "target_tokens",
-				"barge_in_threshold", "vision_resolution", "speaker_volume":
+				"noise_gate_rms", "barge_in_threshold", "vision_resolution", "speaker_volume":
 				if n, err := strconv.Atoi(val); err == nil {
 					updates[key] = n
 				}
 			case "proactive_audio", "echo_shield", "voice_barge_in", "auto_extract_memory",
 				"mirror_camera", "auto_key_failover", "inject_memory", "push_to_talk",
-				"auto_reconnect", "continue_last_session":
+				"auto_reconnect", "continue_last_session", "browser_auto_gain",
+				"browser_echo_cancellation", "browser_noise_suppression":
 				updates[key] = (val == "true" || val == "on" || val == "1")
 			}
 		}

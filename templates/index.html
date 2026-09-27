@@ -167,13 +167,21 @@
               </div>
 
               <div class="grid grid-cols-2 gap-2.5 text-[12px]">
-                <div class="p-2.5 rounded bg-[#f9f9f7] border border-[#e4e4df]">
-                  <div class="flex items-center justify-between text-[#666660] mb-1">
-                    <span>Mic Input RMS</span>
-                    <span id="mic-rms-val" class="font-mono text-[#1a1a19]">0</span>
+                <div class="p-2.5 rounded bg-[#f9f9f7] border border-[#e4e4df] flex flex-col justify-between">
+                  <div>
+                    <div class="flex items-center justify-between text-[#666660] mb-1">
+                      <span>Mic Input RMS</span>
+                      <span id="mic-rms-val" class="font-mono text-[#1a1a19]">0</span>
+                    </div>
+                    <div class="w-full h-2 bg-[#e4e4df] rounded overflow-hidden">
+                      <div id="mic-level-bar" class="h-full bg-[#1f4b7a] transition-all duration-75" style="width: 0%"></div>
+                    </div>
                   </div>
-                  <div class="w-full h-2 bg-[#e4e4df] rounded overflow-hidden">
-                    <div id="mic-level-bar" class="h-full bg-[#1f4b7a] transition-all duration-75" style="width: 0%"></div>
+                  <div class="flex items-center gap-2 mt-1.5">
+                    <span class="text-[11px] text-[#666660] shrink-0">Gate</span>
+                    <input type="range" id="studio-gate-slider" min="200" max="2500" step="50" value="{{.Config.NoiseGateRms}}"
+                      class="w-full accent-[#1a1a19] cursor-pointer h-1.5" />
+                    <span id="studio-gate-label" class="font-mono text-[11px] text-[#1a1a19] w-9 text-right">{{.Config.NoiseGateRms}}</span>
                   </div>
                   <div id="mic-gate-status" class="text-[11px] text-[#777770] mt-1">Idle</div>
                 </div>

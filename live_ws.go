@@ -237,9 +237,12 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 				if err != nil || len(pcmBytes) == 0 {
 					continue
 				}
-				turnMu.Lock()
-				lastUserActivity = time.Now()
-				turnMu.Unlock()
+				isSilent, _ := msg["silent"].(bool)
+				if !isSilent {
+					turnMu.Lock()
+					lastUserActivity = time.Now()
+					turnMu.Unlock()
+				}
 
 				_ = session.SendRealtimeInput(genai.LiveRealtimeInput{
 					Audio: &genai.Blob{
@@ -336,13 +339,15 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			// Update #5: Persist Session Resumption Handle to config.json
+			// Update #5: Persist Session Resumption Handle to config.json asynchronously
 			if resp.SessionResumptionUpdate != nil && resp.SessionResumptionUpdate.NewHandle != "" {
 				newHandle := resp.SessionResumptionUpdate.NewHandle
 				logMu.Lock()
 				latestResumptionHandle = newHandle
 				logMu.Unlock()
-				_ = saveConfigMap(map[string]any{"last_resumption_handle": newHandle})
+				go func(h string) {
+					_ = saveConfigMap(map[string]any{"last_resumption_handle": h})
+				}(newHandle)
 				_ = safeSend(map[string]any{
 					"type":   "resumption_update",
 					"handle": newHandle,
