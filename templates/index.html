@@ -179,9 +179,9 @@
                   </div>
                   <div class="flex items-center gap-2 mt-1.5">
                     <span class="text-[11px] text-[#666660] shrink-0">Gate</span>
-                    <input type="range" id="studio-gate-slider" min="200" max="2500" step="50" value="{{.Config.NoiseGateRms}}"
+                    <input type="range" id="studio-gate-slider" min="0" max="2500" step="50" value="{{.Config.NoiseGateRms}}"
                       class="w-full accent-[#1a1a19] cursor-pointer h-1.5" />
-                    <span id="studio-gate-label" class="font-mono text-[11px] text-[#1a1a19] w-9 text-right">{{.Config.NoiseGateRms}}</span>
+                    <span id="studio-gate-label" class="font-mono text-[11px] text-[#1a1a19] w-9 text-right">{{if eq .Config.NoiseGateRms 0}}Off{{else}}{{.Config.NoiseGateRms}}{{end}}</span>
                   </div>
                   <div id="mic-gate-status" class="text-[11px] text-[#777770] mt-1">Idle</div>
                 </div>

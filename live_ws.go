@@ -111,6 +111,12 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cfg := loadConfig()
+	if vOverride := r.URL.Query().Get("voice"); vOverride != "" {
+		cfg.VoiceName = vOverride
+	}
+	if r.URL.Query().Get("resume") == "true" && cfg.LastResumptionHandle != "" {
+		cfg.ContinueLastSession = true
+	}
 	orderedKeys := getOrderedAPIKeys(cfg.SelectedKey, cfg.AutoKeyFailover)
 	if len(orderedKeys) == 0 {
 		_ = safeSend(map[string]any{
@@ -196,6 +202,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 	var modelTextBuf []string
 	var lastUserActivity time.Time
 	var turnFirstByteLatencyMs int64
+	var modelSpeaking bool
 
 	_ = safeSend(map[string]any{
 		"type":     "connected",
@@ -377,6 +384,11 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 				if sc.InputTranscription != nil && sc.InputTranscription.Text != "" {
 					tx := sc.InputTranscription.Text
 					turnMu.Lock()
+					if modelSpeaking {
+						// Transition from model response to new user turn
+						modelSpeaking = false
+						userTextBuf = nil
+					}
 					userTextBuf = append(userTextBuf, tx)
 					lastUserActivity = time.Now()
 					turnFirstByteLatencyMs = 0
@@ -396,9 +408,12 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 					tx := sc.OutputTranscription.Text
 					var flushedUser string
 					turnMu.Lock()
-					if len(userTextBuf) > 0 {
-						flushedUser = strings.TrimSpace(strings.Join(userTextBuf, ""))
-						userTextBuf = nil
+					if !modelSpeaking {
+						modelSpeaking = true
+						if len(userTextBuf) > 0 {
+							flushedUser = strings.TrimSpace(strings.Join(userTextBuf, ""))
+							userTextBuf = nil
+						}
 					}
 					if turnFirstByteLatencyMs == 0 && !lastUserActivity.IsZero() {
 						turnFirstByteLatencyMs = time.Since(lastUserActivity).Milliseconds()
@@ -407,7 +422,6 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 					fullModel := strings.TrimSpace(strings.Join(modelTextBuf, ""))
 					turnMu.Unlock()
 
-					// Update #4: Acquire logMu only AFTER releasing turnMu (no nested locks)
 					if flushedUser != "" {
 						logMu.Lock()
 						turnsLog = append(turnsLog, TurnEntry{
@@ -416,6 +430,11 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 							Time: time.Now().Format("15:04:05"),
 						})
 						logMu.Unlock()
+
+						_ = safeSend(map[string]any{
+							"type": "user_turn_finalized",
+							"text": flushedUser,
+						})
 					}
 
 					_ = safeSend(map[string]any{
@@ -450,6 +469,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 					turnMu.Lock()
 					flushedModel := strings.TrimSpace(strings.Join(modelTextBuf, ""))
 					modelTextBuf = nil
+					modelSpeaking = false
 					turnMu.Unlock()
 
 					if flushedModel != "" {
@@ -471,6 +491,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 					userTextBuf = nil
 					flushedModel := strings.TrimSpace(strings.Join(modelTextBuf, ""))
 					modelTextBuf = nil
+					modelSpeaking = false
 					latencyMs := turnFirstByteLatencyMs
 					turnFirstByteLatencyMs = 0
 					turnMu.Unlock()
@@ -493,6 +514,13 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 						})
 					}
 					logMu.Unlock()
+
+					if flushedUser != "" {
+						_ = safeSend(map[string]any{
+							"type": "user_turn_finalized",
+							"text": flushedUser,
+						})
+					}
 
 					_ = safeSend(map[string]any{
 						"type":       "turn_complete",

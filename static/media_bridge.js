@@ -65,7 +65,7 @@
         if ($("sidebar-key-label")) $("sidebar-key-label").textContent = appConfig.selected_key || "AUTO";
         if ($("echo-shield-indicator")) {
           $("echo-shield-indicator").textContent = appConfig.echo_shield
-            ? `On (Barge-In > ${appConfig.barge_in_threshold || 3200})`
+            ? `On (Barge-In > ${appConfig.barge_in_threshold || 2800})`
             : "Off";
         }
         if ($("vision-res-select") && appConfig.vision_resolution) {
@@ -73,7 +73,9 @@
         }
         if ($("studio-gate-slider") && appConfig.noise_gate_rms !== undefined) {
           $("studio-gate-slider").value = String(appConfig.noise_gate_rms);
-          if ($("studio-gate-label")) $("studio-gate-label").textContent = String(appConfig.noise_gate_rms);
+          if ($("studio-gate-label")) {
+            $("studio-gate-label").textContent = Number(appConfig.noise_gate_rms) === 0 ? "Off" : String(appConfig.noise_gate_rms);
+          }
         }
         if ($("studio-volume-slider") && appConfig.speaker_volume !== undefined) {
           $("studio-volume-slider").value = String(appConfig.speaker_volume);
@@ -268,14 +270,14 @@
   }
 
   // =========================================================================
-  // 5. Microphone Capture (50ms 16kHz PCM + 850 RMS Gate + Zero-Silence VAD Flush)
+  // 5. Microphone Capture (128ms 16kHz PCM + Echo Shield + Clean VAD Stream)
   // =========================================================================
   const WORKLET_CODE = `
     class LifelMicProcessor extends AudioWorkletProcessor {
       constructor() {
         super();
         this.targetRate = 16000;
-        this.buffer = new Int16Array(800); // 50ms at 16kHz (20 fps low-latency chunks)
+        this.buffer = new Int16Array(2048); // 128ms at 16kHz (Standard Google Live API chunk size)
         this.offset = 0;
         this.resamplePos = 0.0;
       }
@@ -309,14 +311,14 @@
       channelCount: 1,
       echoCancellation: appConfig.browser_echo_cancellation !== false,
       noiseSuppression: appConfig.browser_noise_suppression !== false,
-      autoGainControl: !!appConfig.browser_auto_gain,
+      autoGainControl: appConfig.browser_auto_gain !== false,
     };
     if (micDevId) {
       audioConstraints.deviceId = { exact: micDevId };
     }
 
     micStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
-    micCtx = new (window.AudioContext || window.webkitAudioContext)();
+    micCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
     const blob = new Blob([WORKLET_CODE], { type: "application/javascript" });
     const workletUrl = URL.createObjectURL(blob);
     await micCtx.audioWorklet.addModule(workletUrl);
@@ -325,7 +327,7 @@
     const source = micCtx.createMediaStreamSource(micStream);
     micWorkletNode = new AudioWorkletNode(micCtx, "lifel-mic-processor");
 
-    const silentFrame = new Int16Array(800).buffer;
+    const silentFrame = new Int16Array(2048).buffer;
 
     micWorkletNode.port.onmessage = (ev) => {
       if (!isConnected || !ws || ws.readyState !== WebSocket.OPEN) return;
@@ -357,17 +359,16 @@
 
       const spkActive = isSpeakerPlaying();
       const inCooldown = performance.now() - lastSpeakerEndTime < 220;
-      const gateRms = Number(appConfig.noise_gate_rms ?? 850);
-      const bargeRms = Number(appConfig.barge_in_threshold ?? 3200);
+      const gateRms = Number(appConfig.noise_gate_rms ?? 0);
+      const bargeRms = Number(appConfig.barge_in_threshold ?? 2800);
 
-      // Smart Echo Shield + Loud Voice Barge-In
+      // Smart Echo Shield + Voice Barge-In (Active ONLY while speaker is playing or cooling down)
       if (appConfig.echo_shield && (spkActive || inCooldown)) {
         if (appConfig.voice_barge_in !== false && rms >= bargeRms) {
           bargeInHotFrames++;
           if (bargeInHotFrames >= 2) {
             stopAllPlayback();
             bargeInHotFrames = 0;
-            speechTailFrames = 5;
             sendPcmBuffer(ev.data, false);
             updateMicMeter(rms, "Barge-In Triggered");
             return;
@@ -375,26 +376,33 @@
         } else {
           bargeInHotFrames = 0;
         }
-        // Stream pure digital zeros while speaker is active so VAD clock stays live without echo
+        // While speaker is outputting, send silent frames to prevent acoustic feedback loop
         sendPcmBuffer(silentFrame, true);
         updateMicMeter(rms, "Echo Shield Active");
         return;
       }
 
       bargeInHotFrames = 0;
-      if (rms >= gateRms) {
-        speechTailFrames = 5; // 250ms natural voice tail so word endings are never clipped
+
+      // Normal Speech Mode: Speaker is silent.
+      if (gateRms <= 0) {
+        // Raw mic stream directly to Gemini Live Server Neural VAD (Official Google standard)
         sendPcmBuffer(ev.data, false);
-        updateMicMeter(rms, "Streaming Speech");
-      } else if (speechTailFrames > 0) {
-        speechTailFrames--;
-        sendPcmBuffer(ev.data, false);
-        updateMicMeter(rms, "Speech Tail");
+        updateMicMeter(rms, rms > 220 ? "Speaking" : "Listening");
       } else {
-        // Stream pure digital zeros continuously when below noise gate so Server VAD
-        // clock advances in real time and fires end-of-speech within ~300ms
-        sendPcmBuffer(silentFrame, true);
-        updateMicMeter(rms, `Gate Closed (< ${gateRms})`);
+        // Optional noise gate if user explicitly set slider > 0
+        if (rms >= gateRms) {
+          speechTailFrames = 6; // ~760ms tail so word endings and pauses are never clipped
+          sendPcmBuffer(ev.data, false);
+          updateMicMeter(rms, "Streaming Speech");
+        } else if (speechTailFrames > 0) {
+          speechTailFrames--;
+          sendPcmBuffer(ev.data, false);
+          updateMicMeter(rms, "Speech Tail");
+        } else {
+          sendPcmBuffer(silentFrame, true);
+          updateMicMeter(rms, `Gate Closed (< ${gateRms})`);
+        }
       }
     };
 
@@ -768,8 +776,8 @@
   // =========================================================================
   // 8. Live WebSocket Session Lifecycle + Ping/Pong RTT + Auto-Reconnect
   // =========================================================================
-  async function connectLiveSession() {
-    if (isConnected) {
+  async function connectLiveSession(urlOverride = null) {
+    if (isConnected && !urlOverride) {
       userInitiatedDisconnect = true;
       disconnectLiveSession();
       return;
@@ -785,14 +793,17 @@
       btn.disabled = true;
     }
 
-    try {
-      await startMicrophone();
-    } catch (err) {
-      appendSystemNotice(`Microphone permission warning: ${err.message}. Continuing in text/speaker mode.`, true);
+    if (!micStream) {
+      try {
+        await startMicrophone();
+      } catch (err) {
+        appendSystemNotice(`Microphone permission warning: ${err.message}. Continuing in text/speaker mode.`, true);
+      }
     }
 
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    ws = new WebSocket(`${proto}//${location.host}/ws/live`);
+    const url = urlOverride || `${proto}//${location.host}/ws/live`;
+    ws = new WebSocket(url);
 
     ws.onopen = () => {
       if ($("live-status-text")) $("live-status-text").textContent = "Handshaking with Gemini Live API...";
@@ -868,17 +879,23 @@
           break;
 
         case "input_tx":
-          // Update #3: Keep accumulating within the current turn bubble; only finalize on turn_complete
           updateOrCreateBubble("user", msg.full || msg.text, false);
           break;
 
+        case "user_turn_finalized":
         case "user_text_committed":
-          currentUserBubble = null;
-          updateOrCreateBubble("user", msg.text, true);
+          if (currentUserBubble) {
+            currentUserBubble.body.textContent = msg.text;
+            currentUserBubble = null;
+          } else {
+            updateOrCreateBubble("user", msg.text, true);
+          }
           break;
 
         case "output_tx":
-          // Update #3: Keep accumulating within the current turn bubble; only finalize on turn_complete/interrupted
+          if (currentUserBubble) {
+            currentUserBubble = null;
+          }
           updateOrCreateBubble("gemini", msg.full || msg.text, false);
           break;
 
@@ -892,6 +909,7 @@
             currentModelBubble.body.textContent += " [Interrupted]";
             currentModelBubble = null;
           }
+          currentUserBubble = null;
           break;
 
         case "turn_complete":
@@ -945,6 +963,26 @@
     ws.onerror = () => {
       appendSystemNotice("WebSocket connection error occurred.", true);
     };
+  }
+
+  async function reconnectWithVoice(newVoice) {
+    if (!isConnected || !ws) return;
+    activeVoiceName = newVoice;
+    if ($("sidebar-voice-label")) $("sidebar-voice-label").textContent = newVoice;
+    
+    userInitiatedDisconnect = true;
+    try {
+      ws.send(JSON.stringify({ type: "disconnect" }));
+      ws.close();
+    } catch (_) {}
+    ws = null;
+    userInitiatedDisconnect = false;
+
+    await new Promise((r) => setTimeout(r, 200));
+
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const url = `${proto}//${location.host}/ws/live?voice=${encodeURIComponent(newVoice)}&resume=true`;
+    await connectLiveSession(url);
   }
 
   function disconnectLiveSession() {
@@ -1032,14 +1070,14 @@
     });
   });
 
-  // Mic Noise Gate RMS Slider
+  // Mic Noise Gate RMS Slider (0 = Off / Raw Audio)
   $("studio-gate-slider")?.addEventListener("input", (ev) => {
-    const gate = parseInt(ev.target.value, 10) || 850;
+    const gate = isNaN(parseInt(ev.target.value, 10)) ? 0 : parseInt(ev.target.value, 10);
     appConfig.noise_gate_rms = gate;
-    if ($("studio-gate-label")) $("studio-gate-label").textContent = String(gate);
+    if ($("studio-gate-label")) $("studio-gate-label").textContent = gate === 0 ? "Off" : String(gate);
   });
   $("studio-gate-slider")?.addEventListener("change", (ev) => {
-    const gate = parseInt(ev.target.value, 10) || 850;
+    const gate = isNaN(parseInt(ev.target.value, 10)) ? 0 : parseInt(ev.target.value, 10);
     fetch("/api/config", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1222,6 +1260,16 @@
   if (toolSelect && toolArgsInput && toolSelect.options.length > 0) {
     toolArgsInput.value = toolSelect.options[0].getAttribute("data-sample") || "{}";
   }
+
+  // Listen for HTMX configUpdated event to trigger mid-session voice switching seamlessly
+  document.body.addEventListener("configUpdated", async () => {
+    const prevVoice = activeVoiceName;
+    await syncStateFromServer();
+    if (isConnected && appConfig.voice_name && appConfig.voice_name !== prevVoice) {
+      appendSystemNotice(`Switching voice to ${appConfig.voice_name} (resuming session)...`);
+      await reconnectWithVoice(appConfig.voice_name);
+    }
+  });
 
   // Initialize on page load
   syncStateFromServer();
