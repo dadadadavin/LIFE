@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -94,7 +93,7 @@ func buildLiveConnectConfig(cfg AppConfig, activeKeyName string) *genai.LiveConn
 func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 	conn, err := wsUpgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("[WS Upgrade Error]: %v", err)
+		fmt.Printf("%s \033[31m[WS UPGRADE ERROR]\033[0m %v (remote: %s)\n", time.Now().Format("15:04:05"), err, r.RemoteAddr)
 		return
 	}
 	defer conn.Close()
@@ -117,11 +116,17 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("resume") == "true" && cfg.LastResumptionHandle != "" {
 		cfg.ContinueLastSession = true
 	}
+
+	fmt.Printf("\n%s \033[1;34m[WS CONNECT]\033[0m Client connected from %s (Voice: %s, Resume: %v)\n",
+		time.Now().Format("15:04:05"), r.RemoteAddr, cfg.VoiceName, cfg.ContinueLastSession)
+
 	orderedKeys := getOrderedAPIKeys(cfg.SelectedKey, cfg.AutoKeyFailover)
 	if len(orderedKeys) == 0 {
+		errMsg := "No Gemini API keys configured in .env. Please add a key in the API Keys tab."
+		fmt.Printf("%s \033[31m[WS ERROR]\033[0m %s\n", time.Now().Format("15:04:05"), errMsg)
 		_ = safeSend(map[string]any{
 			"type":    "error",
-			"message": "No Gemini API keys configured in .env. Please add a key in the API Keys tab.",
+			"message": errMsg,
 		})
 		return
 	}
@@ -135,6 +140,8 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 	var lastConnErr error
 
 	for _, k := range orderedKeys {
+		fmt.Printf("%s \033[34m[GEMINI]\033[0m Handshaking with %s using key slot %s...\n",
+			time.Now().Format("15:04:05"), cfg.Model, k.Name)
 		_ = safeSend(map[string]any{
 			"type":    "status",
 			"message": fmt.Sprintf("Connecting to %s using %s...", cfg.Model, k.Name),
@@ -150,6 +157,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 		client, err := genai.NewClient(ctx, clientCfg)
 		if err != nil {
 			lastConnErr = err
+			fmt.Printf("%s \033[33m[GEMINI WARNING]\033[0m Key %s client creation error: %v\n", time.Now().Format("15:04:05"), k.Name, err)
 			continue
 		}
 
@@ -157,6 +165,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 		sess, err := client.Live.Connect(ctx, cfg.Model, liveCfg)
 		if err != nil {
 			lastConnErr = err
+			fmt.Printf("%s \033[33m[GEMINI WARNING]\033[0m Key %s connection failed: %v\n", time.Now().Format("15:04:05"), k.Name, err)
 			_ = safeSend(map[string]any{
 				"type":    "status",
 				"message": fmt.Sprintf("Key %s failed (%v), trying fallback...", k.Name, err),
@@ -175,6 +184,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 		if lastConnErr != nil {
 			errMsg = fmt.Sprintf("All API keys failed. Last error: %v", lastConnErr)
 		}
+		fmt.Printf("%s \033[31m[GEMINI ERROR]\033[0m %s\n", time.Now().Format("15:04:05"), errMsg)
 		_ = safeSend(map[string]any{
 			"type":    "error",
 			"message": errMsg,
@@ -182,6 +192,9 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer session.Close()
+
+	fmt.Printf("%s \033[1;32m[GEMINI SUCCESS]\033[0m Live session ready! Model: %s | Voice: %s | Key: %s\n",
+		time.Now().Format("15:04:05"), cfg.Model, cfg.VoiceName, connectedKeyName)
 
 	// Clear one-time resume_session_id once connected
 	if cfg.ResumeSessionID != "" {
@@ -196,6 +209,16 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 	var turnsLog []TurnEntry
 	var latestResumptionHandle string
 	var latestUsage UsageStats
+
+	defer func() {
+		dur := time.Since(sessionStart).Seconds()
+		logMu.Lock()
+		numTurns := len(turnsLog)
+		tokens := latestUsage.TotalTokens
+		logMu.Unlock()
+		fmt.Printf("\n%s \033[1;34m[WS DISCONNECT]\033[0m Session %s ended. Duration: %.1fs | Turns: %d | Tokens: %d\n",
+			time.Now().Format("15:04:05"), sessionID, dur, numTurns, tokens)
+	}()
 
 	var turnMu sync.Mutex
 	var userTextBuf []string
@@ -276,6 +299,8 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 				if mimeType == "" {
 					mimeType = "image/jpeg"
 				}
+				fmt.Printf("%s \033[36m[VISION]\033[0m Ingested frame (%d bytes, %s)\n",
+					time.Now().Format("15:04:05"), len(jpegBytes), mimeType)
 				_ = session.SendRealtimeInput(genai.LiveRealtimeInput{
 					Video: &genai.Blob{
 						Data:     jpegBytes,
@@ -289,6 +314,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 				if textVal == "" {
 					continue
 				}
+				fmt.Printf("%s \033[1;36m[USER TEXT]\033[0m %s\n", time.Now().Format("15:04:05"), textVal)
 				nowStr := time.Now().Format("15:04:05")
 				logMu.Lock()
 				turnsLog = append(turnsLog, TurnEntry{
@@ -335,6 +361,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 			resp, err := session.Receive()
 			if err != nil {
 				if ctx.Err() == nil {
+					fmt.Printf("%s \033[31m[GEMINI STREAM CLOSED]\033[0m %v\n", time.Now().Format("15:04:05"), err)
 					_ = safeSend(map[string]any{
 						"type":    "error",
 						"message": fmt.Sprintf("Gemini stream closed: %v", err),
@@ -352,6 +379,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 				logMu.Lock()
 				latestResumptionHandle = newHandle
 				logMu.Unlock()
+				fmt.Printf("%s \033[35m[RESUMPTION]\033[0m Handle saved: %s\n", time.Now().Format("15:04:05"), newHandle)
 				go func(h string) {
 					_ = saveConfigMap(map[string]any{"last_resumption_handle": h})
 				}(newHandle)
@@ -423,6 +451,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 					turnMu.Unlock()
 
 					if flushedUser != "" {
+						fmt.Printf("%s \033[1;36m[USER]\033[0m %s\n", time.Now().Format("15:04:05"), flushedUser)
 						logMu.Lock()
 						turnsLog = append(turnsLog, TurnEntry{
 							Role: "user",
@@ -473,6 +502,8 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 					turnMu.Unlock()
 
 					if flushedModel != "" {
+						fmt.Printf("%s \033[33m[INTERRUPTED]\033[0m Gemini speech interrupted: \"%s\"\n",
+							time.Now().Format("15:04:05"), flushedModel)
 						logMu.Lock()
 						turnsLog = append(turnsLog, TurnEntry{
 							Role: "model",
@@ -499,6 +530,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 					nowStr := time.Now().Format("15:04:05")
 					logMu.Lock()
 					if flushedUser != "" {
+						fmt.Printf("%s \033[1;36m[USER]\033[0m %s\n", nowStr, flushedUser)
 						turnsLog = append(turnsLog, TurnEntry{
 							Role: "user",
 							Text: flushedUser,
@@ -506,6 +538,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 						})
 					}
 					if flushedModel != "" {
+						fmt.Printf("%s \033[1;32m[GEMINI (%s)]\033[0m %s\n", nowStr, cfg.VoiceName, flushedModel)
 						turnsLog = append(turnsLog, TurnEntry{
 							Role:      "model",
 							Text:      flushedModel,
@@ -513,7 +546,13 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 							LatencyMs: latencyMs,
 						})
 					}
+					tokensTotal := latestUsage.TotalTokens
+					promptTok := latestUsage.PromptTokens
+					respTok := latestUsage.ResponseTokens
 					logMu.Unlock()
+
+					fmt.Printf("%s \033[36m[LATENCY]\033[0m Turn latency: %dms | Tokens: prompt=%d, resp=%d, total=%d\n",
+						nowStr, latencyMs, promptTok, respTok, tokensTotal)
 
 					if flushedUser != "" {
 						_ = safeSend(map[string]any{
@@ -537,6 +576,9 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 					if argsMap == nil {
 						argsMap = map[string]any{}
 					}
+					argsJSON, _ := json.Marshal(argsMap)
+					fmt.Printf("%s \033[1;33m[TOOL CALL]\033[0m %s(%s)\n", time.Now().Format("15:04:05"), fc.Name, string(argsJSON))
+
 					_ = safeSend(map[string]any{
 						"type": "tool_call",
 						"id":   fc.ID,
@@ -544,7 +586,9 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 						"args": argsMap,
 					})
 
+					t0 := time.Now()
 					resultData := executeLocalTool(fc.Name, argsMap)
+					durTool := time.Since(t0)
 
 					// Update #10: Handle browser HD frame request & native macOS screen JPEG injection
 					if reqFrame, ok := resultData["_request_browser_hd_frame"].(bool); ok && reqFrame {
@@ -572,8 +616,10 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 					}
 
 					nowStr := time.Now().Format("15:04:05")
-					argsJSON, _ := json.Marshal(argsMap)
 					resJSON, _ := json.Marshal(resultData)
+					fmt.Printf("%s \033[33m[TOOL RESULT]\033[0m %s in %v -> %s\n",
+						nowStr, fc.Name, durTool.Truncate(100*time.Microsecond), string(resJSON))
+
 					logMu.Lock()
 					turnsLog = append(turnsLog, TurnEntry{
 						Role: "tool",

@@ -23,6 +23,8 @@
   let isPttHolding = false;
   let userInitiatedDisconnect = false;
   let pingInterval = null;
+  let reconnectAttempts = 0;
+  const MAX_RECONNECT = 3;
 
   // Audio contexts & nodes
   let micCtx = null;
@@ -830,6 +832,7 @@
 
         case "connected":
           isConnected = true;
+          reconnectAttempts = 0;
           activeVoiceName = msg.voice || appConfig.voice_name || "Puck";
           if (btn) {
             btn.textContent = "Disconnect";
@@ -951,17 +954,29 @@
       const unexpectedDrop = isConnected && !userInitiatedDisconnect;
       cleanupSessionUI();
       if (unexpectedDrop && appConfig.auto_reconnect !== false) {
-        appendSystemNotice("Connection dropped unexpectedly. Auto-reconnecting in 2 seconds...");
-        setTimeout(() => {
-          if (!isConnected && !userInitiatedDisconnect) {
-            connectLiveSession();
-          }
-        }, 2000);
+        if (reconnectAttempts < MAX_RECONNECT) {
+          reconnectAttempts++;
+          appendSystemNotice(`Connection dropped. Auto-reconnecting (${reconnectAttempts}/${MAX_RECONNECT}) in 2s...`);
+          setTimeout(() => {
+            if (!isConnected && !userInitiatedDisconnect) {
+              connectLiveSession();
+            }
+          }, 2000);
+        } else {
+          reconnectAttempts = 0;
+          appendSystemNotice("Unable to reconnect. Please check terminal logs and click 'Start Live Session' to retry.", true);
+        }
+      } else {
+        reconnectAttempts = 0;
       }
     };
 
     ws.onerror = () => {
-      appendSystemNotice("WebSocket connection error occurred.", true);
+      if (!isConnected) {
+        appendSystemNotice(`WebSocket failed to connect to ${url}. Make sure './lifel' is running in your terminal.`, true);
+      } else {
+        appendSystemNotice("WebSocket connection error occurred.", true);
+      }
     };
   }
 

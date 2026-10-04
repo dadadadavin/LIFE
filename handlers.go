@@ -542,6 +542,7 @@ func registerRoutes(mux *http.ServeMux) {
 		}
 
 		_ = saveConfigMap(updates)
+		fmt.Printf("%s \033[36m[CONFIG]\033[0m Updated %d settings in config.json\n", time.Now().Format("15:04:05"), len(updates))
 		w.Header().Set("HX-Trigger", "configUpdated")
 		writeHTML(w, `<span class="inline-flex items-center px-2.5 py-1 rounded text-[12px] font-medium bg-[#e6f3ec] text-[#1f5c3a] border border-[#bfe0ce]">Saved to config.json</span>`)
 	})
@@ -551,6 +552,7 @@ func registerRoutes(mux *http.ServeMux) {
 		vName := strings.TrimSpace(r.FormValue("voice_name"))
 		if vName != "" {
 			_ = saveConfigMap(map[string]any{"voice_name": vName})
+			fmt.Printf("%s \033[36m[VOICE]\033[0m Selected voice profile: %s\n", time.Now().Format("15:04:05"), vName)
 		}
 		cfg := loadConfig()
 		w.Header().Set("HX-Trigger", "configUpdated")
@@ -573,6 +575,7 @@ func registerRoutes(mux *http.ServeMux) {
 		pinned := r.FormValue("pinned") == "true" || r.FormValue("pinned") == "on"
 		if content != "" {
 			addMemoryItem(content, cat, "manual", pinned)
+			fmt.Printf("%s \033[35m[MEMORY]\033[0m Stored new fact [%s]: %s\n", time.Now().Format("15:04:05"), cat, content)
 		}
 		writeHTML(w, renderMemoryListHTML("", ""))
 	})
