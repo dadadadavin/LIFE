@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"html/template"
@@ -56,6 +57,19 @@ func (w *statusResponseWriter) WriteHeader(code int) {
 	w.ResponseWriter.WriteHeader(code)
 }
 
+func (w *statusResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hj, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return hj.Hijack()
+	}
+	return nil, nil, fmt.Errorf("underlying ResponseWriter does not implement http.Hijacker")
+}
+
+func (w *statusResponseWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 func requestLoggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -63,12 +77,20 @@ func requestLoggingMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(sw, r)
 		duration := time.Since(start)
 
-		// Omit static assets from terminal logging unless error
-		if strings.HasPrefix(r.URL.Path, "/static/") && sw.statusCode < 400 {
+		// Omit static assets and favicon from terminal logging unless error
+		if (strings.HasPrefix(r.URL.Path, "/static/") || r.URL.Path == "/favicon.ico") && sw.statusCode < 400 {
 			return
 		}
 
 		timeStr := time.Now().Format("15:04:05")
+
+		// WebSocket upgrade requests hijack connection (HTTP 101)
+		if strings.ToLower(r.Header.Get("Upgrade")) == "websocket" || strings.HasPrefix(r.URL.Path, "/ws/") {
+			fmt.Printf("%s [HTTP] %-6s %-28s \033[36m101\033[0m %8s  (%s)\n",
+				timeStr, r.Method, r.URL.Path, duration.Truncate(100*time.Microsecond), r.RemoteAddr)
+			return
+		}
+
 		statusColor := "\033[32m" // green
 		if sw.statusCode >= 400 {
 			statusColor = "\033[31m" // red
@@ -125,6 +147,9 @@ func main() {
 	mux := http.NewServeMux()
 	staticDir := filepath.Join(baseDir, "static")
 	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.Dir(staticDir))))
+	mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
 	registerRoutes(mux)
 
 	allKeys := getAllEnvKeys()
