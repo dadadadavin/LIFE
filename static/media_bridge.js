@@ -779,7 +779,8 @@
   // 8. Live WebSocket Session Lifecycle + Ping/Pong RTT + Auto-Reconnect
   // =========================================================================
   async function connectLiveSession(urlOverride = null) {
-    if (isConnected && !urlOverride) {
+    const validUrl = typeof urlOverride === "string" && (urlOverride.startsWith("ws://") || urlOverride.startsWith("wss://")) ? urlOverride : null;
+    if (isConnected && !validUrl) {
       userInitiatedDisconnect = true;
       disconnectLiveSession();
       return;
@@ -804,7 +805,7 @@
     }
 
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const url = urlOverride || `${proto}//${location.host}/ws/live`;
+    const url = validUrl || `${proto}//${location.host}/ws/live`;
     ws = new WebSocket(url);
 
     ws.onopen = () => {
@@ -1068,7 +1069,9 @@
     }
   }
 
-  $("btn-connect")?.addEventListener("click", connectLiveSession);
+  $("btn-connect")?.addEventListener("click", () => {
+    connectLiveSession();
+  });
   $("btn-mute")?.addEventListener("click", toggleMute);
   $("btn-interrupt")?.addEventListener("click", () => {
     stopAllPlayback();

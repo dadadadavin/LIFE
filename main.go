@@ -50,6 +50,7 @@ func initTemplates() error {
 type statusResponseWriter struct {
 	http.ResponseWriter
 	statusCode int
+	hijacked   bool
 }
 
 func (w *statusResponseWriter) WriteHeader(code int) {
@@ -59,6 +60,8 @@ func (w *statusResponseWriter) WriteHeader(code int) {
 
 func (w *statusResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if hj, ok := w.ResponseWriter.(http.Hijacker); ok {
+		w.hijacked = true
+		w.statusCode = http.StatusSwitchingProtocols
 		return hj.Hijack()
 	}
 	return nil, nil, fmt.Errorf("underlying ResponseWriter does not implement http.Hijacker")
@@ -85,7 +88,7 @@ func requestLoggingMiddleware(next http.Handler) http.Handler {
 		timeStr := time.Now().Format("15:04:05")
 
 		// WebSocket upgrade requests hijack connection (HTTP 101)
-		if strings.ToLower(r.Header.Get("Upgrade")) == "websocket" || strings.HasPrefix(r.URL.Path, "/ws/") {
+		if sw.hijacked || sw.statusCode == http.StatusSwitchingProtocols {
 			fmt.Printf("%s [HTTP] %-6s %-28s \033[36m101\033[0m %8s  (%s)\n",
 				timeStr, r.Method, r.URL.Path, duration.Truncate(100*time.Microsecond), r.RemoteAddr)
 			return
