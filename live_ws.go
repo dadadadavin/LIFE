@@ -409,6 +409,27 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 
 			if sc := resp.ServerContent; sc != nil {
 				// 1. Input Audio Transcription (User speech)
+				if sc.InterimInputTranscription != nil && sc.InterimInputTranscription.Text != "" {
+					tx := sc.InterimInputTranscription.Text
+					turnMu.Lock()
+					lastUserActivity = time.Now()
+					turnFirstByteLatencyMs = 0
+					fullUser := strings.TrimSpace(strings.Join(userTextBuf, ""))
+					if fullUser != "" {
+						fullUser += " " + tx
+					} else {
+						fullUser = tx
+					}
+					turnMu.Unlock()
+
+					_ = safeSend(map[string]any{
+						"type":    "input_tx",
+						"text":    tx,
+						"full":    fullUser,
+						"interim": true,
+					})
+				}
+
 				if sc.InputTranscription != nil && sc.InputTranscription.Text != "" {
 					tx := sc.InputTranscription.Text
 					turnMu.Lock()

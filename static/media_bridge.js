@@ -22,6 +22,7 @@
   let isMuted = false;
   let isPttHolding = false;
   let userInitiatedDisconnect = false;
+  let isSwitchingVoice = false;
   let pingInterval = null;
   let reconnectAttempts = 0;
   const MAX_RECONNECT = 3;
@@ -986,19 +987,21 @@
     activeVoiceName = newVoice;
     if ($("sidebar-voice-label")) $("sidebar-voice-label").textContent = newVoice;
     
+    isSwitchingVoice = true;
     userInitiatedDisconnect = true;
     try {
       ws.send(JSON.stringify({ type: "disconnect" }));
       ws.close();
     } catch (_) {}
     ws = null;
-    userInitiatedDisconnect = false;
 
-    await new Promise((r) => setTimeout(r, 200));
+    await new Promise((r) => setTimeout(r, 150));
+    userInitiatedDisconnect = false;
 
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const url = `${proto}//${location.host}/ws/live?voice=${encodeURIComponent(newVoice)}&resume=true`;
     await connectLiveSession(url);
+    isSwitchingVoice = false;
   }
 
   function disconnectLiveSession() {
@@ -1027,7 +1030,9 @@
     }
     if ($("sidebar-rtt-label")) $("sidebar-rtt-label").textContent = "--";
 
-    stopMicrophone();
+    if (!isSwitchingVoice) {
+      stopMicrophone();
+    }
     stopAllPlayback();
 
     const btn = $("btn-connect");
