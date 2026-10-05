@@ -9,7 +9,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -113,6 +115,53 @@ func requestLoggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+func killPreviousInstances(port string) {
+	myPid := os.Getpid()
+	killedPids := make(map[int]bool)
+
+	// 1. Terminate any previous processes named 'lifel'
+	if out, err := exec.Command("pgrep", "-x", "lifel").Output(); err == nil {
+		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			if pid, err := strconv.Atoi(line); err == nil && pid != myPid && !killedPids[pid] {
+				if proc, err := os.FindProcess(pid); err == nil {
+					_ = proc.Kill()
+					killedPids[pid] = true
+					fmt.Printf("\033[33m[CLEANUP]\033[0m Terminated previous lifel instance (PID %d)\n", pid)
+				}
+			}
+		}
+	}
+
+	// 2. Terminate any process currently occupying the port
+	if port != "" {
+		if out, err := exec.Command("lsof", "-ti", ":"+port).Output(); err == nil {
+			lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+				if pid, err := strconv.Atoi(line); err == nil && pid != myPid && !killedPids[pid] {
+					if proc, err := os.FindProcess(pid); err == nil {
+						_ = proc.Kill()
+						killedPids[pid] = true
+						fmt.Printf("\033[33m[CLEANUP]\033[0m Terminated stale process occupying port %s (PID %d)\n", port, pid)
+					}
+				}
+			}
+		}
+	}
+
+	if len(killedPids) > 0 {
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
 func main() {
 	portFlag := flag.String("port", "", "Server port (defaults to $PORT or 8000)")
 	flag.Parse()
@@ -135,13 +184,24 @@ func main() {
 	}
 	addr := "127.0.0.1:" + port
 
-	// Check if port is already bound to provide helpful troubleshooting output
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
+	killPreviousInstances(port)
+
+	// Bind to listener with retry
+	var listener net.Listener
+	var listenErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		listener, listenErr = net.Listen("tcp", addr)
+		if listenErr == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if listenErr != nil {
 		fmt.Printf("\n\033[31m╔══════════════════════════════════════════════════════════════════════════╗\033[0m\n")
 		fmt.Printf("\033[31m║ [PORT CONFLICT ERROR] Address %s is already in use!             ║\033[0m\n", addr)
 		fmt.Printf("\033[31m╚══════════════════════════════════════════════════════════════════════════╝\033[0m\n\n")
-		fmt.Printf("Another process is currently holding port %s.\n", port)
+		fmt.Printf("Could not bind to port %s: %v\n", port, listenErr)
 		fmt.Printf("• To terminate it on macOS run:  \033[33mlsof -ti :%s | xargs kill -9\033[0m\n", port)
 		fmt.Printf("• Or run Lifel on a different port:  \033[32m./lifel -port 8080\033[0m  or  \033[32mPORT=8080 ./lifel\033[0m\n\n")
 		os.Exit(1)
