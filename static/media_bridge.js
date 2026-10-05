@@ -1074,6 +1074,9 @@
     }
   }
 
+  window.connectLiveSession = () => {
+    connectLiveSession();
+  };
   $("btn-connect")?.addEventListener("click", () => {
     connectLiveSession();
   });

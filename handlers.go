@@ -21,13 +21,14 @@ type ToolView struct {
 }
 
 type PageData struct {
-	Config   AppConfig
-	Voices   []VoiceCatalogItem
-	Memories []MemoryItem
-	Tools    []ToolView
-	Sessions []SessionSummaryItem
-	Keys     []KeyInfo
-	Notes    []NoteItem
+	Config    AppConfig
+	Voices    []VoiceCatalogItem
+	Memories  []MemoryItem
+	Tools     []ToolView
+	Sessions  []SessionSummaryItem
+	Keys      []KeyInfo
+	Notes     []NoteItem
+	BuildTime int64
 }
 
 func buildToolViews(cfg AppConfig) []ToolView {
@@ -48,13 +49,14 @@ func buildToolViews(cfg AppConfig) []ToolView {
 func buildPageData() PageData {
 	cfg := loadConfig()
 	return PageData{
-		Config:   cfg,
-		Voices:   VoiceCatalog,
-		Memories: loadMemories(),
-		Tools:    buildToolViews(cfg),
-		Sessions: listSessionSummaries(),
-		Keys:     listKeyInfos(cfg),
-		Notes:    listNotes(),
+		Config:    cfg,
+		Voices:    VoiceCatalog,
+		Memories:  loadMemories(),
+		Tools:     buildToolViews(cfg),
+		Sessions:  listSessionSummaries(),
+		Keys:      listKeyInfos(cfg),
+		Notes:     listNotes(),
+		BuildTime: time.Now().UnixNano(),
 	}
 }
 

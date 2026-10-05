@@ -77,13 +77,18 @@ func (w *statusResponseWriter) Flush() {
 
 func requestLoggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Bulletproof alias: rewrite any corrupted PointerEvent URL directly to /ws/live
+		if strings.Contains(r.URL.Path, "PointerEvent") {
+			r.URL.Path = "/ws/live"
+		}
+
 		start := time.Now()
 		sw := &statusResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
 		next.ServeHTTP(sw, r)
 		duration := time.Since(start)
 
-		// Omit static assets and favicon from terminal logging unless error
-		if (strings.HasPrefix(r.URL.Path, "/static/") || r.URL.Path == "/favicon.ico") && sw.statusCode < 400 {
+		// Omit generic static assets and favicon unless error, but allow media_bridge.js so asset updates are visible
+		if (strings.HasPrefix(r.URL.Path, "/static/") && !strings.HasSuffix(r.URL.Path, "media_bridge.js") || r.URL.Path == "/favicon.ico") && sw.statusCode < 400 {
 			return
 		}
 
@@ -209,7 +214,13 @@ func main() {
 
 	mux := http.NewServeMux()
 	staticDir := filepath.Join(baseDir, "static")
-	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.Dir(staticDir))))
+	fs := http.FileServer(http.Dir(staticDir))
+	mux.Handle("GET /static/", http.StripPrefix("/static/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Expires", "0")
+		fs.ServeHTTP(w, r)
+	})))
 	mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
