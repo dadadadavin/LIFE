@@ -958,10 +958,12 @@
       if (unexpectedDrop && appConfig.auto_reconnect !== false) {
         if (reconnectAttempts < MAX_RECONNECT) {
           reconnectAttempts++;
-          appendSystemNotice(`Connection dropped. Auto-reconnecting (${reconnectAttempts}/${MAX_RECONNECT}) in 2s...`);
+          appendSystemNotice(`Connection dropped. Auto-reconnecting (${reconnectAttempts}/${MAX_RECONNECT}) in 2s with session resumption...`);
           setTimeout(() => {
             if (!isConnected && !userInitiatedDisconnect) {
-              connectLiveSession();
+              const proto = location.protocol === "https:" ? "wss:" : "ws:";
+              const resumeUrl = `${proto}//${location.host}/ws/live?resume=true`;
+              connectLiveSession(resumeUrl);
             }
           }, 2000);
         } else {

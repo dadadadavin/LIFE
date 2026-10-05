@@ -460,14 +460,21 @@ func buildFullSystemPrompt(cfg AppConfig, activeKeyName string) string {
 		}
 	}
 
-	// Resumed Session Context (Update #5)
-	if cfg.ResumeSessionID != "" {
-		if rec, err := getSessionRecord(cfg.ResumeSessionID); err == nil && len(rec.Turns) > 0 {
+	// Resumed Session Context (Dual-Layer Context Fallback)
+	targetSessionID := cfg.ResumeSessionID
+	if targetSessionID == "" && cfg.ContinueLastSession {
+		summaries := listSessionSummaries()
+		if len(summaries) > 0 {
+			targetSessionID = summaries[0].ID
+		}
+	}
+	if targetSessionID != "" {
+		if rec, err := getSessionRecord(targetSessionID); err == nil && len(rec.Turns) > 0 {
 			sb.WriteString(fmt.Sprintf("\n\n=== RESUMED CONVERSATION CONTEXT (Session %s from %s) ===\n", rec.ID, rec.StartedAt))
 			sb.WriteString("The user is continuing this previous conversation. Pick up naturally where you left off:\n")
 			startIdx := 0
-			if len(rec.Turns) > 16 {
-				startIdx = len(rec.Turns) - 16
+			if len(rec.Turns) > 20 {
+				startIdx = len(rec.Turns) - 20
 			}
 			for _, t := range rec.Turns[startIdx:] {
 				sb.WriteString(fmt.Sprintf("[%s] %s: %s\n", t.Time, strings.ToUpper(t.Role), t.Text))

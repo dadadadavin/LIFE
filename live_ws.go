@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -20,6 +21,17 @@ var wsUpgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
 		return true
 	},
+}
+
+func init() {
+	var stdDialer = &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	websocket.DefaultDialer.NetDialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		// Force IPv4 for outbound Live API connections to eliminate ISP IPv6 route flapping
+		return stdDialer.DialContext(ctx, "tcp4", addr)
+	}
 }
 
 func buildLiveConnectConfig(cfg AppConfig, activeKeyName string) *genai.LiveConnectConfig {
@@ -66,7 +78,9 @@ func buildLiveConnectConfig(cfg AppConfig, activeKeyName string) *genai.LiveConn
 	}
 
 	if cfg.SessionResumption {
-		resCfg := &genai.SessionResumptionConfig{}
+		resCfg := &genai.SessionResumptionConfig{
+			Transparent: true,
+		}
 		if cfg.ContinueLastSession && cfg.LastResumptionHandle != "" {
 			resCfg.Handle = cfg.LastResumptionHandle
 		}
@@ -113,7 +127,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 	if vOverride := r.URL.Query().Get("voice"); vOverride != "" {
 		cfg.VoiceName = vOverride
 	}
-	if r.URL.Query().Get("resume") == "true" && cfg.LastResumptionHandle != "" {
+	if r.URL.Query().Get("resume") == "true" {
 		cfg.ContinueLastSession = true
 	}
 
@@ -163,6 +177,11 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 
 		liveCfg := buildLiveConnectConfig(cfg, k.Name)
 		sess, err := client.Live.Connect(ctx, cfg.Model, liveCfg)
+		if err != nil && liveCfg.SessionResumption != nil && liveCfg.SessionResumption.Handle != "" {
+			fmt.Printf("%s \033[33m[GEMINI RESUMPTION]\033[0m Handle resume failed (%v), retrying without handle using injected context...\n", time.Now().Format("15:04:05"), err)
+			liveCfg.SessionResumption.Handle = ""
+			sess, err = client.Live.Connect(ctx, cfg.Model, liveCfg)
+		}
 		if err != nil {
 			lastConnErr = err
 			fmt.Printf("%s \033[33m[GEMINI WARNING]\033[0m Key %s connection failed: %v\n", time.Now().Format("15:04:05"), k.Name, err)
@@ -760,7 +779,7 @@ Transcript:
 %s`, convoText)
 
 	temp := float32(0.1)
-	resp, err := client.Models.GenerateContent(ctx, "gemini-3.5-flash", []*genai.Content{
+	resp, err := client.Models.GenerateContent(ctx, "gemini-3.8-flash", []*genai.Content{
 		{
 			Role:  "user",
 			Parts: []*genai.Part{{Text: prompt}},
@@ -769,7 +788,11 @@ Transcript:
 		Temperature:      &temp,
 		ResponseMIMEType: "application/json",
 	})
-	if err != nil || resp == nil {
+	if err != nil {
+		fmt.Printf("%s \033[33m[MEMORY WARNING]\033[0m Extraction error: %v\n", time.Now().Format("15:04:05"), err)
+		return
+	}
+	if resp == nil {
 		return
 	}
 
@@ -796,6 +819,8 @@ Transcript:
 			fmt.Sprintf("auto:%s", sessionID),
 			true,
 		)
+		fmt.Printf("%s \033[35m[MEMORY]\033[0m Updated rolling session summary: \"%s\"\n",
+			time.Now().Format("15:04:05"), strings.TrimSpace(parsed.Summary))
 	}
 	for _, f := range parsed.Facts {
 		if strings.TrimSpace(f.Fact) != "" {
@@ -804,6 +829,8 @@ Transcript:
 				cat = "fact"
 			}
 			addMemoryItem(f.Fact, cat, fmt.Sprintf("auto:%s", sessionID), false)
+			fmt.Printf("%s \033[35m[MEMORY]\033[0m Stored new durable fact [%s]: %s\n",
+				time.Now().Format("15:04:05"), cat, f.Fact)
 		}
 	}
 }
