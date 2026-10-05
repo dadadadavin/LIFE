@@ -871,6 +871,12 @@
           }
           break;
 
+        case "resumption_update":
+          if (msg.handle) {
+            appConfig.last_resumption_handle = msg.handle;
+          }
+          break;
+
         case "memory_updated":
           if (window.htmx && $("memory-list-container")) {
             window.htmx.ajax("GET", "/htmx/memory", { target: "#memory-list-container", swap: "innerHTML" });
@@ -1298,6 +1304,13 @@
       await reconnectWithVoice(appConfig.voice_name);
     }
   });
+
+  // Auto-resume suspended AudioContext on first user interaction
+  window.addEventListener("pointerdown", () => {
+    if (playCtx && playCtx.state === "suspended") {
+      playCtx.resume();
+    }
+  }, { once: true });
 
   // Initialize on page load
   syncStateFromServer();

@@ -918,7 +918,7 @@ func verifyAPIKey(apiKey string) (bool, int64, string) {
 		return false, 0, err.Error()
 	}
 
-	resp, err := client.Models.GenerateContent(ctx, "gemini-3.5-flash", []*genai.Content{
+	resp, err := client.Models.GenerateContent(ctx, "gemini-3.8-flash", []*genai.Content{
 		{
 			Role:  "user",
 			Parts: []*genai.Part{{Text: "Reply with OK"}},
