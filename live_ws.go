@@ -78,9 +78,7 @@ func buildLiveConnectConfig(cfg AppConfig, activeKeyName string) *genai.LiveConn
 	}
 
 	if cfg.SessionResumption {
-		resCfg := &genai.SessionResumptionConfig{
-			Transparent: true,
-		}
+		resCfg := &genai.SessionResumptionConfig{}
 		if cfg.ContinueLastSession && cfg.LastResumptionHandle != "" {
 			resCfg.Handle = cfg.LastResumptionHandle
 		}
@@ -177,9 +175,9 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 
 		liveCfg := buildLiveConnectConfig(cfg, k.Name)
 		sess, err := client.Live.Connect(ctx, cfg.Model, liveCfg)
-		if err != nil && liveCfg.SessionResumption != nil && liveCfg.SessionResumption.Handle != "" {
-			fmt.Printf("%s \033[33m[GEMINI RESUMPTION]\033[0m Handle resume failed (%v), retrying without handle using injected context...\n", time.Now().Format("15:04:05"), err)
-			liveCfg.SessionResumption.Handle = ""
+		if err != nil && liveCfg.SessionResumption != nil {
+			fmt.Printf("%s \033[33m[GEMINI RESUMPTION]\033[0m Session resumption failed (%v), retrying without resumption config...\n", time.Now().Format("15:04:05"), err)
+			liveCfg.SessionResumption = nil
 			sess, err = client.Live.Connect(ctx, cfg.Model, liveCfg)
 		}
 		if err != nil {
