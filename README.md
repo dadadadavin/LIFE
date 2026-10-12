@@ -16,9 +16,11 @@ A low-latency, real-time multimodal voice, vision, and local tool workbench powe
   - `get_mac_system_info`, `mac_clipboard`, `open_url_or_app`, `capture_mac_screen`
   - `save_user_memory`, `search_user_memory`, `list_project_files`, `read_project_file`, `write_project_note`, `calculate_math`
 - **Persistent Memory Bank & Session Continuation**:
-  - Pinned memories, inline editing, automatic post-session memory extraction & rolling session summaries (`gemini-3.5-flash`), and one-click session resumption.
+  - Pinned memories, inline editing, automatic post-session memory extraction & rolling session summaries (`gemini-3.8-flash`), and one-click session resumption.
 - **Multi-Key Failover Rotation**:
   - Supports multiple `GEMINI_API_KEY_*` slots in `.env` with automatic failover on quota or connection errors.
+
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for full system diagrams, audio/vision pipelines, and design specifications.
 
 ## Quick Start
 
