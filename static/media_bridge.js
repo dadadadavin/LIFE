@@ -5,8 +5,8 @@
     voice_name: "Puck",
     echo_shield: true,
     voice_barge_in: true,
-    noise_gate_rms: 850,
-    barge_in_threshold: 3200,
+    noise_gate_rms: 0,
+    barge_in_threshold: 600,
     vision_resolution: 1080,
     mirror_camera: false,
     browser_echo_cancellation: true,
@@ -39,6 +39,8 @@
   let speechTailFrames = 0;
   let silenceFlushFrames = 0;
   let bargeInHotFrames = 0;
+  let preRollBuffers = []; // Rolling buffer of recent PCM chunks (128ms each) to preserve onset words during barge-in
+  const PRE_ROLL_MAX = 3;  // ~384ms pre-roll window
 
   // Vision state
   let videoStream = null;
@@ -68,7 +70,7 @@
         if ($("sidebar-key-label")) $("sidebar-key-label").textContent = appConfig.selected_key || "AUTO";
         if ($("echo-shield-indicator")) {
           $("echo-shield-indicator").textContent = appConfig.echo_shield
-            ? `On (Barge-In > ${appConfig.barge_in_threshold || 2800})`
+            ? `On (Barge-In > ${appConfig.barge_in_threshold || 600})`
             : "Off";
         }
         if ($("vision-res-select") && appConfig.vision_resolution) {
@@ -268,7 +270,7 @@
     if (playCtx) {
       nextPlayTime = playCtx.currentTime;
     }
-    lastSpeakerEndTime = performance.now();
+    lastSpeakerEndTime = 0;
     updateSpeakerUI();
   }
 
@@ -333,8 +335,12 @@
     const silentFrame = new Int16Array(2048).buffer;
 
     micWorkletNode.port.onmessage = (ev) => {
-      if (!isConnected || !ws || ws.readyState !== WebSocket.OPEN) return;
+      if (!isConnected || !ws || ws.readyState !== WebSocket.OPEN) {
+        preRollBuffers = [];
+        return;
+      }
       if (isMuted) {
+        preRollBuffers = [];
         sendPcmBuffer(silentFrame, true);
         updateMicMeter(0, "Muted");
         return;
@@ -361,31 +367,43 @@
       }
 
       const spkActive = isSpeakerPlaying();
-      const inCooldown = performance.now() - lastSpeakerEndTime < 220;
+      const inCooldown = (performance.now() - lastSpeakerEndTime) < 220;
       const gateRms = Number(appConfig.noise_gate_rms ?? 0);
-      const bargeRms = Number(appConfig.barge_in_threshold ?? 2800);
+      const bargeRms = Number(appConfig.barge_in_threshold ?? 600);
 
       // Smart Echo Shield + Voice Barge-In (Active ONLY while speaker is playing or cooling down)
       if (appConfig.echo_shield && (spkActive || inCooldown)) {
         if (appConfig.voice_barge_in !== false && rms >= bargeRms) {
-          bargeInHotFrames++;
-          if (bargeInHotFrames >= 2) {
-            stopAllPlayback();
-            bargeInHotFrames = 0;
-            sendPcmBuffer(ev.data, false);
-            updateMicMeter(rms, "Barge-In Triggered");
-            return;
-          }
-        } else {
+          // User spoke while speaker was active -> INSTANT BARGE-IN!
+          stopAllPlayback();
           bargeInHotFrames = 0;
+
+          // 1. Flush rolling pre-roll buffer so opening words ("Wait", "Can you", "1, 2") are preserved!
+          while (preRollBuffers.length > 0) {
+            sendPcmBuffer(preRollBuffers.shift(), false);
+          }
+
+          // 2. Send current frame
+          sendPcmBuffer(ev.data, false);
+          updateMicMeter(rms, "Barge-In Triggered");
+          return;
         }
-        // While speaker is outputting, send silent frames to prevent acoustic feedback loop
+
+        // Speaker is outputting and user is not speaking louder than bargeRms.
+        // Maintain rolling pre-roll buffer of recent audio (~384ms)
+        preRollBuffers.push(ev.data.slice(0));
+        if (preRollBuffers.length > PRE_ROLL_MAX) {
+          preRollBuffers.shift();
+        }
+
+        // Send silent frames to Gemini to prevent acoustic feedback loop
         sendPcmBuffer(silentFrame, true);
         updateMicMeter(rms, "Echo Shield Active");
         return;
       }
 
       bargeInHotFrames = 0;
+      preRollBuffers = [];
 
       // Normal Speech Mode: Speaker is silent.
       if (gateRms <= 0) {
@@ -920,7 +938,6 @@
             currentModelBubble.body.textContent += " [Interrupted]";
             currentModelBubble = null;
           }
-          currentUserBubble = null;
           break;
 
         case "turn_complete":

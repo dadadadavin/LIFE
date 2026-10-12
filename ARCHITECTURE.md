@@ -116,7 +116,7 @@ sequenceDiagram
 - **Input Sample Rate**: `16,000 Hz`, 16-bit Mono PCM.
 - **Chunk Size**: `128 ms` (`2048` samples per buffer), adhering to Google's real-time input specifications.
 - **Output Sample Rate**: `24,000 Hz`, 16-bit Mono PCM, scheduled seamlessly via Web Audio API `AudioBufferSourceNode` timestamps.
-- **Echo Shield**: An intelligent half-duplex suppression shield with dynamic voice barge-in. While audio is playing through Mac speakers, mic frames are silenced unless the user speaks louder than the configured `barge_in_threshold` (default: `2800` RMS).
+- **Echo Shield & Barge-In**: An intelligent half-duplex suppression shield with dynamic voice barge-in and a rolling 3-chunk (~384ms) PCM pre-roll buffer. While audio is playing through Mac speakers, mic frames are suppressed unless the user speaks louder than the configured `barge_in_threshold` (default: `600` RMS). Upon speech onset, speaker playback is immediately killed, cooldown is reset, and the buffered pre-roll audio is flushed to Gemini Live so opening consonants/words ("Wait", "Can you", "1, 2") are never clipped.
 
 ---
 

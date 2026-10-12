@@ -429,6 +429,11 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 				if sc.InterimInputTranscription != nil && sc.InterimInputTranscription.Text != "" {
 					tx := sc.InterimInputTranscription.Text
 					turnMu.Lock()
+					if modelSpeaking {
+						// User began interrupting during model output
+						modelSpeaking = false
+						userTextBuf = nil
+					}
 					lastUserActivity = time.Now()
 					turnFirstByteLatencyMs = 0
 					fullUser := strings.TrimSpace(strings.Join(userTextBuf, ""))

@@ -500,9 +500,9 @@
           <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
               <label class="block text-[12px] font-medium text-[#444440] mb-1">Voice Barge-In RMS Threshold (While Speaker Playing)</label>
-              <input type="number" name="barge_in_threshold" value="{{.Config.BargeInThreshold}}" min="500" max="10000"
+              <input type="number" name="barge_in_threshold" value="{{.Config.BargeInThreshold}}" min="100" max="5000"
                 class="w-full px-3 py-1.5 rounded border border-[#d4d4ce] bg-white text-[12.5px]" />
-              <span class="text-[11px] text-[#777770]">Speaking louder than this RMS while Gemini is talking immediately interrupts Gemini (default: 3200).</span>
+              <span class="text-[11px] text-[#777770]">Speaking louder than this RMS while Gemini is talking immediately interrupts Gemini with pre-roll buffer audio (default: 600 RMS).</span>
             </div>
             <div>
               <label class="block text-[12px] font-medium text-[#444440] mb-1">Tool Response Scheduling</label>

@@ -73,7 +73,7 @@ type AppConfig struct {
 	EchoShield                bool     `json:"echo_shield"`
 	VoiceBargeIn              bool     `json:"voice_barge_in"`
 	NoiseGateRms              int      `json:"noise_gate_rms"`     // Mic noise gate RMS threshold (default 850)
-	BargeInThreshold          int      `json:"barge_in_threshold"` // RMS threshold while speaker playing (e.g. 3200)
+	BargeInThreshold          int      `json:"barge_in_threshold"` // RMS threshold while speaker playing (e.g. 600)
 	PushToTalk                bool     `json:"push_to_talk"`       // Hold V key to transmit mic audio
 	SpeakerVolume             int      `json:"speaker_volume"`     // 0 - 150 (%)
 	AutoReconnect             bool     `json:"auto_reconnect"`     // Auto reconnect on unexpected drop
@@ -120,13 +120,13 @@ func defaultConfig() AppConfig {
 		EchoShield:              true,
 		VoiceBargeIn:            true,
 		NoiseGateRms:            0,
-		BargeInThreshold:        2800,
+		BargeInThreshold:        600,
 		PushToTalk:              false,
 		SpeakerVolume:           100,
 		AutoReconnect:           true,
 		StartSensitivity:        "START_SENSITIVITY_HIGH",
 		EndSensitivity:          "END_SENSITIVITY_LOW",
-		PrefixPaddingMs:         200,
+		PrefixPaddingMs:         300,
 		SilenceDurationMs:       800,
 		TurnCoverage:            "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO",
 		ProactiveAudio:          false,
