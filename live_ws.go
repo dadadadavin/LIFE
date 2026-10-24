@@ -43,18 +43,17 @@ func buildLiveConnectConfig(cfg AppConfig, activeKeyName string) *genai.LiveConn
 
 	fullPrompt := buildFullSystemPrompt(cfg, activeKeyName)
 
+	isRobotics := strings.Contains(cfg.Model, "robotics")
+	var modalities []genai.Modality
+	if isRobotics {
+		modalities = []genai.Modality{genai.ModalityText}
+	} else {
+		modalities = []genai.Modality{genai.ModalityAudio}
+	}
+
 	liveCfg := &genai.LiveConnectConfig{
-		ResponseModalities: []genai.Modality{genai.ModalityAudio},
+		ResponseModalities: modalities,
 		Temperature:        &temp,
-		SpeechConfig: &genai.SpeechConfig{
-			VoiceConfig: &genai.VoiceConfig{
-				PrebuiltVoiceConfig: &genai.PrebuiltVoiceConfig{
-					VoiceName: cfg.VoiceName,
-				},
-			},
-		},
-		InputAudioTranscription:  &genai.AudioTranscriptionConfig{},
-		OutputAudioTranscription: &genai.AudioTranscriptionConfig{},
 		RealtimeInputConfig: &genai.RealtimeInputConfig{
 			ActivityHandling: genai.ActivityHandling(cfg.ActivityHandling),
 			TurnCoverage:     genai.TurnCoverage(cfg.TurnCoverage),
@@ -68,6 +67,18 @@ func buildLiveConnectConfig(cfg AppConfig, activeKeyName string) *genai.LiveConn
 		SystemInstruction: &genai.Content{
 			Parts: []*genai.Part{{Text: fullPrompt}},
 		},
+	}
+
+	if !isRobotics {
+		liveCfg.SpeechConfig = &genai.SpeechConfig{
+			VoiceConfig: &genai.VoiceConfig{
+				PrebuiltVoiceConfig: &genai.PrebuiltVoiceConfig{
+					VoiceName: cfg.VoiceName,
+				},
+			},
+		}
+		liveCfg.InputAudioTranscription = &genai.AudioTranscriptionConfig{}
+		liveCfg.OutputAudioTranscription = &genai.AudioTranscriptionConfig{}
 	}
 
 	if cfg.ProactiveAudio {
@@ -125,12 +136,15 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 	if vOverride := r.URL.Query().Get("voice"); vOverride != "" {
 		cfg.VoiceName = vOverride
 	}
+	if mOverride := r.URL.Query().Get("model"); mOverride != "" {
+		cfg.Model = mOverride
+	}
 	if r.URL.Query().Get("resume") == "true" {
 		cfg.ContinueLastSession = true
 	}
 
-	fmt.Printf("\n%s \033[1;34m[WS CONNECT]\033[0m Client connected from %s (Voice: %s, Resume: %v)\n",
-		time.Now().Format("15:04:05"), r.RemoteAddr, cfg.VoiceName, cfg.ContinueLastSession)
+	fmt.Printf("\n%s \033[1;34m[WS CONNECT]\033[0m Client connected from %s (Model: %s, Voice: %s, Resume: %v)\n",
+		time.Now().Format("15:04:05"), r.RemoteAddr, cfg.Model, cfg.VoiceName, cfg.ContinueLastSession)
 
 	orderedKeys := getOrderedAPIKeys(cfg.SelectedKey, cfg.AutoKeyFailover)
 	if len(orderedKeys) == 0 {
@@ -148,7 +162,6 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	var session *genai.Session
 	var connectedKeyName string
-	var connectedKeyVal string
 	var lastConnErr error
 
 	for _, k := range orderedKeys {
@@ -192,7 +205,6 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 
 		session = sess
 		connectedKeyName = k.Name
-		connectedKeyVal = k.Value
 		break
 	}
 
@@ -517,7 +529,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 					})
 				}
 
-				// 3. Model Turn Audio Parts (Strictly ignore thought text parts!)
+				// 3. Model Turn Parts (Audio for TTS models, Text for Robotics ER models)
 				if sc.ModelTurn != nil {
 					for _, part := range sc.ModelTurn.Parts {
 						if part.InlineData != nil && len(part.InlineData.Data) > 0 {
@@ -531,6 +543,21 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 							_ = safeSend(map[string]any{
 								"type": "audio",
 								"data": b64Audio,
+							})
+						} else if part.Text != "" && !part.Thought {
+							turnMu.Lock()
+							modelSpeaking = true
+							if turnFirstByteLatencyMs == 0 && !lastUserActivity.IsZero() {
+								turnFirstByteLatencyMs = time.Since(lastUserActivity).Milliseconds()
+							}
+							modelTextBuf = append(modelTextBuf, part.Text)
+							fullModel := strings.TrimSpace(strings.Join(modelTextBuf, ""))
+							turnMu.Unlock()
+
+							_ = safeSend(map[string]any{
+								"type": "output_tx",
+								"text": part.Text,
+								"full": fullModel,
 							})
 						}
 					}
@@ -738,17 +765,14 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	if cfg.AutoExtractMemory && len(finalTurns) >= 2 && connectedKeyVal != "" {
-		go extractMemoriesAndSummary(connectedKeyVal, sessionID, finalTurns)
+	if cfg.AutoExtractMemory && len(finalTurns) >= 2 {
+		go extractMemoriesAndSummary(sessionID, finalTurns, cfg.SelectedKey)
 	}
 }
 
-// extractMemoriesAndSummary runs after a session ends using gemini-3.5-flash
-// to extract durable facts AND update the rolling "Last Session Summary" memory item.
-func extractMemoriesAndSummary(apiKey string, sessionID string, turns []TurnEntry) {
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
-	defer cancel()
-
+// extractMemoriesAndSummary runs after a session ends with automatic multi-key failover
+// and retry backoff to extract durable facts AND update the rolling "Last Session Summary".
+func extractMemoriesAndSummary(sessionID string, turns []TurnEntry, preferredKey string) {
 	var lines []string
 	for _, t := range turns {
 		if t.Role == "tool" {
@@ -765,14 +789,6 @@ func extractMemoriesAndSummary(apiKey string, sessionID string, turns []TurnEntr
 	}
 	convoText := strings.Join(lines, "\n")
 
-	client, err := genai.NewClient(ctx, &genai.ClientConfig{
-		APIKey:  apiKey,
-		Backend: genai.BackendGeminiAPI,
-	})
-	if err != nil {
-		return
-	}
-
 	prompt := fmt.Sprintf(`Analyze this voice conversation transcript between the User and Gemini.
 Return a JSON object with two fields:
 1. "summary": A concise 1-2 sentence summary of what was discussed or accomplished in this session.
@@ -781,26 +797,84 @@ Return a JSON object with two fields:
 Transcript:
 %s`, convoText)
 
-	temp := float32(0.1)
-	resp, err := client.Models.GenerateContent(ctx, "gemini-3.8-flash", []*genai.Content{
-		{
-			Role:  "user",
-			Parts: []*genai.Part{{Text: prompt}},
-		},
-	}, &genai.GenerateContentConfig{
-		Temperature:      &temp,
-		ResponseMIMEType: "application/json",
-	})
-	if err != nil {
-		fmt.Printf("%s \033[33m[MEMORY WARNING]\033[0m Extraction error: %v\n", time.Now().Format("15:04:05"), err)
-		return
-	}
-	if resp == nil {
+	keys := getOrderedAPIKeys(preferredKey, true)
+	if len(keys) == 0 {
 		return
 	}
 
-	rawJSON := strings.TrimSpace(resp.Text())
+	var rawJSON string
+	var lastErr error
+
+	for keyIdx, k := range keys {
+		for attempt := 0; attempt < 2; attempt++ {
+			if attempt > 0 {
+				time.Sleep(time.Duration(attempt) * 1200 * time.Millisecond)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			client, err := genai.NewClient(ctx, &genai.ClientConfig{
+				APIKey:  k.Value,
+				Backend: genai.BackendGeminiAPI,
+			})
+			if err != nil {
+				cancel()
+				lastErr = err
+				continue
+			}
+
+			temp := float32(0.1)
+			resp, err := client.Models.GenerateContent(ctx, "gemini-3.8-flash", []*genai.Content{
+				{
+					Role:  "user",
+					Parts: []*genai.Part{{Text: prompt}},
+				},
+			}, &genai.GenerateContentConfig{
+				Temperature:      &temp,
+				ResponseMIMEType: "application/json",
+			})
+			cancel()
+
+			if err == nil && resp != nil {
+				rawJSON = strings.TrimSpace(resp.Text())
+				if rawJSON != "" {
+					break
+				}
+			} else {
+				lastErr = err
+				fmt.Printf("%s \033[33m[MEMORY RETRY]\033[0m Key %s attempt %d error: %v\n",
+					time.Now().Format("15:04:05"), k.Name, attempt+1, err)
+			}
+		}
+		if rawJSON != "" {
+			break
+		}
+		if keyIdx < len(keys)-1 {
+			fmt.Printf("%s \033[33m[MEMORY FAILOVER]\033[0m Key %s failed, trying next key slot...\n",
+				time.Now().Format("15:04:05"), k.Name)
+		}
+	}
+
 	if rawJSON == "" {
+		fmt.Printf("%s \033[33m[MEMORY WARNING]\033[0m Extraction error after key failover (%v). Writing local fallback summary...\n",
+			time.Now().Format("15:04:05"), lastErr)
+		var userUtterances []string
+		for _, t := range turns {
+			if t.Role == "user" && len(t.Text) > 4 {
+				userUtterances = append(userUtterances, t.Text)
+			}
+		}
+		fallback := "Session discussed topics."
+		if len(userUtterances) > 0 {
+			if len(userUtterances) > 3 {
+				userUtterances = userUtterances[len(userUtterances)-3:]
+			}
+			fallback = fmt.Sprintf("Topics: %s", strings.Join(userUtterances, " | "))
+		}
+		addMemoryItem(
+			fmt.Sprintf("Last session (%s): %s", sessionID, fallback),
+			"summary",
+			fmt.Sprintf("auto:%s", sessionID),
+			true,
+		)
 		return
 	}
 

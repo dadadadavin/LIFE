@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"html"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -908,6 +910,123 @@ func registerRoutes(mux *http.ServeMux) {
 
 	mux.HandleFunc("GET /api/notes", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"notes": listNotes()})
+	})
+
+	// ========================================================================
+	// Robotics & Spatial Vision Inspection API
+	// ========================================================================
+	type RoboticsInspectRequest struct {
+		ImageBase64 string `json:"image"`
+		Prompt      string `json:"prompt"`
+		Model       string `json:"model"`
+	}
+
+	type BoundingBoxItem struct {
+		Box2D [4]int `json:"box_2d"` // [ymin, xmin, ymax, xmax] 0-1000
+		Label string `json:"label"`
+	}
+
+	reBox2D := regexp.MustCompile(`\{\s*"box_2d"\s*:\s*\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]\s*,\s*"label"\s*:\s*"([^"]+)"`)
+
+	mux.HandleFunc("POST /api/robotics/inspect", func(w http.ResponseWriter, r *http.Request) {
+		var req RoboticsInspectRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		if req.Prompt == "" {
+			req.Prompt = "Detect all objects in this scene. Return each object's 2D bounding box [ymin, xmin, ymax, xmax] on a 0-1000 scale followed by the object label, affordances, and action sequence."
+		}
+		if req.Model == "" {
+			req.Model = "gemini-robotics-er-2-preview"
+		}
+
+		cleanB64 := req.ImageBase64
+		if idx := strings.Index(cleanB64, ","); idx != -1 {
+			cleanB64 = cleanB64[idx+1:]
+		}
+
+		rawBytes, err := base64.StdEncoding.DecodeString(cleanB64)
+		if err != nil || len(rawBytes) == 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid base64 image"})
+			return
+		}
+
+		cfg := loadConfig()
+		keys := getOrderedAPIKeys(cfg.SelectedKey, cfg.AutoKeyFailover)
+		if len(keys) == 0 {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "no API keys configured"})
+			return
+		}
+
+		start := time.Now()
+		var respText string
+		var lastErr error
+
+		for _, k := range keys {
+			ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+			client, err := genai.NewClient(ctx, &genai.ClientConfig{
+				APIKey:  k.Value,
+				Backend: genai.BackendGeminiAPI,
+			})
+			if err != nil {
+				cancel()
+				lastErr = err
+				continue
+			}
+
+			resp, err := client.Models.GenerateContent(ctx, req.Model, []*genai.Content{
+				{
+					Role: "user",
+					Parts: []*genai.Part{
+						{
+							InlineData: &genai.Blob{
+								Data:     rawBytes,
+								MIMEType: "image/jpeg",
+							},
+						},
+						{
+							Text: req.Prompt,
+						},
+					},
+				},
+			}, nil)
+			cancel()
+
+			if err == nil && resp != nil {
+				respText = resp.Text()
+				break
+			}
+			lastErr = err
+		}
+
+		if respText == "" {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"error": fmt.Sprintf("Inspection failed: %v", lastErr)})
+			return
+		}
+
+		latMs := time.Since(start).Milliseconds()
+
+		var boxes []BoundingBoxItem
+		matches := reBox2D.FindAllStringSubmatch(respText, -1)
+		for _, m := range matches {
+			ymin, _ := strconv.Atoi(m[1])
+			xmin, _ := strconv.Atoi(m[2])
+			ymax, _ := strconv.Atoi(m[3])
+			xmax, _ := strconv.Atoi(m[4])
+			boxes = append(boxes, BoundingBoxItem{
+				Box2D: [4]int{ymin, xmin, ymax, xmax},
+				Label: m[5],
+			})
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":     "ok",
+			"model":      req.Model,
+			"raw_text":   respText,
+			"boxes":      boxes,
+			"latency_ms": latMs,
+		})
 	})
 
 	mux.HandleFunc("POST /api/keys/test/{name}", func(w http.ResponseWriter, r *http.Request) {

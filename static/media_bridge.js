@@ -120,6 +120,7 @@
   // =========================================================================
   const tabTitles = {
     studio: "Live Studio",
+    robotics: "🦾 Robotics ER-2 — Embodied Reasoning Playground",
     config: "Configuration",
     voice: "Voice & Audio",
     memory: "Memory Bank",
@@ -1328,6 +1329,291 @@
       playCtx.resume();
     }
   }, { once: true });
+
+  // =========================================================================
+  // 12. Robotics ER-2 Playground Controller (Spatial Grounding & Bounding Boxes)
+  // =========================================================================
+  let roboticsStream = null;
+  let roboticsMode = null; // "cam" | "screen" | "image"
+  let roboticsCurrentB64 = null;
+
+  const robColors = [
+    { stroke: "#3b82f6", fill: "rgba(59, 130, 246, 0.25)", text: "#ffffff" },
+    { stroke: "#10b981", fill: "rgba(16, 185, 129, 0.25)", text: "#ffffff" },
+    { stroke: "#f59e0b", fill: "rgba(245, 158, 11, 0.25)", text: "#000000" },
+    { stroke: "#ec4899", fill: "rgba(236, 72, 153, 0.25)", text: "#ffffff" },
+    { stroke: "#8b5cf6", fill: "rgba(139, 92, 246, 0.25)", text: "#ffffff" },
+    { stroke: "#06b6d4", fill: "rgba(6, 182, 212, 0.25)", text: "#ffffff" },
+  ];
+
+  function drawBoundingBoxes(boxes) {
+    const canvas = $("robotics-canvas");
+    if (!canvas) return;
+
+    const ctx = canvas.getContext("2d");
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width;
+    canvas.height = rect.height;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    if (!boxes || boxes.length === 0) {
+      if ($("robotics-detection-count")) $("robotics-detection-count").textContent = "0 objects detected";
+      if ($("robotics-boxes-list")) $("robotics-boxes-list").innerHTML = '<span class="text-[11px] text-[#888880] italic">No detections yet.</span>';
+      return;
+    }
+
+    if ($("robotics-detection-count")) {
+      $("robotics-detection-count").textContent = `${boxes.length} objects detected`;
+    }
+
+    // Render Box Pills
+    if ($("robotics-boxes-list")) {
+      let pillsHtml = "";
+      boxes.forEach((b, idx) => {
+        const color = robColors[idx % robColors.length];
+        const coordStr = b.box_2d ? `[${b.box_2d.join(", ")}]` : "";
+        pillsHtml += `<span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[11px] font-mono border" style="border-color:${color.stroke}; background-color:${color.fill}; color:${color.stroke}">
+          <strong>${b.label || "Object"}</strong> <span class="opacity-80">${coordStr}</span>
+        </span>`;
+      });
+      $("robotics-boxes-list").innerHTML = pillsHtml;
+    }
+
+    // Draw on canvas (0-1000 normalized coordinates)
+    boxes.forEach((b, idx) => {
+      if (!b.box_2d || b.box_2d.length < 4) return;
+      const [ymin, xmin, ymax, xmax] = b.box_2d;
+      const color = robColors[idx % robColors.length];
+
+      const x = (xmin / 1000.0) * canvas.width;
+      const y = (ymin / 1000.0) * canvas.height;
+      const w = ((xmax - xmin) / 1000.0) * canvas.width;
+      const h = ((ymax - ymin) / 1000.0) * canvas.height;
+
+      ctx.lineWidth = 2.5;
+      ctx.strokeStyle = color.stroke;
+      ctx.fillStyle = color.fill;
+      ctx.fillRect(x, y, w, h);
+      ctx.strokeRect(x, y, w, h);
+
+      const labelText = `${b.label || "Object"}`;
+      ctx.font = "bold 11px system-ui, -apple-system, sans-serif";
+      const textMetrics = ctx.measureText(labelText);
+      const pillW = textMetrics.width + 10;
+      const pillH = 18;
+      const pillY = Math.max(0, y - pillH);
+
+      ctx.fillStyle = color.stroke;
+      ctx.fillRect(x, pillY, pillW, pillH);
+
+      ctx.fillStyle = color.text;
+      ctx.textBaseline = "middle";
+      ctx.fillText(labelText, x + 5, pillY + pillH / 2);
+    });
+  }
+
+  function parseBoxesFromText(text) {
+    const boxes = [];
+    const jsonMatch = text.match(/```(?:json)?\s*(\[\s*\{[\s\S]*?\}\s*\])\s*```/);
+    if (jsonMatch) {
+      try {
+        const parsed = JSON.parse(jsonMatch[1]);
+        if (Array.isArray(parsed)) {
+          parsed.forEach((item) => {
+            if (item.box_2d && Array.isArray(item.box_2d) && item.box_2d.length === 4) {
+              boxes.push({ box_2d: item.box_2d, label: item.label || "object" });
+            }
+          });
+        }
+      } catch (_) {}
+    }
+    if (boxes.length === 0) {
+      const re = /\{\s*"box_2d"\s*:\s*\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]\s*,\s*"label"\s*:\s*"([^"]+)"/g;
+      let m;
+      while ((m = re.exec(text)) !== null) {
+        boxes.push({
+          box_2d: [parseInt(m[1]), parseInt(m[2]), parseInt(m[3]), parseInt(m[4])],
+          label: m[5],
+        });
+      }
+    }
+    return boxes;
+  }
+
+  async function captureRoboticsFrameJPEG() {
+    if (roboticsMode === "image" && roboticsCurrentB64) {
+      return roboticsCurrentB64;
+    }
+    const video = $("robotics-video");
+    if (!video || !roboticsStream) {
+      return null;
+    }
+    const offscreen = document.createElement("canvas");
+    offscreen.width = video.videoWidth || 640;
+    offscreen.height = video.videoHeight || 480;
+    const ctx = offscreen.getContext("2d");
+    ctx.drawImage(video, 0, 0, offscreen.width, offscreen.height);
+    const dataUrl = offscreen.toDataURL("image/jpeg", 0.85);
+    return dataUrl.split(",")[1];
+  }
+
+  async function startRoboticsCamera() {
+    try {
+      if (roboticsStream) {
+        roboticsStream.getTracks().forEach((t) => t.stop());
+      }
+      roboticsStream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+      });
+      const video = $("robotics-video");
+      video.srcObject = roboticsStream;
+      video.classList.remove("hidden");
+      $("robotics-img-preview")?.classList.add("hidden");
+      $("robotics-empty-state")?.classList.add("hidden");
+      roboticsMode = "cam";
+      $("btn-robotics-cam").textContent = "Stop Camera";
+    } catch (err) {
+      alert("Failed to start camera for Robotics ER-2: " + err.message);
+    }
+  }
+
+  async function startRoboticsScreen() {
+    try {
+      if (roboticsStream) {
+        roboticsStream.getTracks().forEach((t) => t.stop());
+      }
+      roboticsStream = await navigator.mediaDevices.getDisplayMedia({
+        video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+      });
+      const video = $("robotics-video");
+      video.srcObject = roboticsStream;
+      video.classList.remove("hidden");
+      $("robotics-img-preview")?.classList.add("hidden");
+      $("robotics-empty-state")?.classList.add("hidden");
+      roboticsMode = "screen";
+      $("btn-robotics-screen").textContent = "Stop Screen";
+    } catch (err) {
+      alert("Screen sharing cancelled or unavailable: " + err.message);
+    }
+  }
+
+  $("btn-robotics-cam")?.addEventListener("click", () => {
+    if (roboticsMode === "cam" && roboticsStream) {
+      roboticsStream.getTracks().forEach((t) => t.stop());
+      roboticsStream = null;
+      roboticsMode = null;
+      $("robotics-video")?.classList.add("hidden");
+      $("robotics-empty-state")?.classList.remove("hidden");
+      $("btn-robotics-cam").textContent = "Start Camera";
+      drawBoundingBoxes([]);
+    } else {
+      startRoboticsCamera();
+    }
+  });
+
+  $("btn-robotics-screen")?.addEventListener("click", () => {
+    if (roboticsMode === "screen" && roboticsStream) {
+      roboticsStream.getTracks().forEach((t) => t.stop());
+      roboticsStream = null;
+      roboticsMode = null;
+      $("robotics-video")?.classList.add("hidden");
+      $("robotics-empty-state")?.classList.remove("hidden");
+      $("btn-robotics-screen").textContent = "Share Screen";
+      drawBoundingBoxes([]);
+    } else {
+      startRoboticsScreen();
+    }
+  });
+
+  $("robotics-file-input")?.addEventListener("change", (ev) => {
+    const file = ev.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const dataUrl = e.target.result;
+      roboticsCurrentB64 = dataUrl.split(",")[1];
+      roboticsMode = "image";
+      const img = $("robotics-img-preview");
+      if (img) {
+        img.src = dataUrl;
+        img.classList.remove("hidden");
+      }
+      $("robotics-video")?.classList.add("hidden");
+      $("robotics-empty-state")?.classList.add("hidden");
+      drawBoundingBoxes([]);
+    };
+    reader.readAsDataURL(file);
+  });
+
+  $("btn-robotics-clear-boxes")?.addEventListener("click", () => {
+    drawBoundingBoxes([]);
+  });
+
+  document.querySelectorAll(".btn-robotics-preset").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const p = btn.getAttribute("data-prompt");
+      if ($("robotics-prompt-input")) {
+        $("robotics-prompt-input").value = p;
+      }
+    });
+  });
+
+  $("btn-robotics-inspect")?.addEventListener("click", async () => {
+    const b64 = await captureRoboticsFrameJPEG();
+    if (!b64) {
+      alert("Please start camera or upload an image first.");
+      return;
+    }
+    const prompt = $("robotics-prompt-input")?.value || "Detect all objects in 2D bounding boxes.";
+    const terminal = $("robotics-output-terminal");
+    const inspectBtn = $("btn-robotics-inspect");
+
+    inspectBtn.disabled = true;
+    inspectBtn.innerHTML = `<span>⏳ Inspecting with ER-2...</span>`;
+    terminal.textContent = "Dispatching frame to gemini-robotics-er-2-preview...";
+
+    try {
+      const res = await fetch("/api/robotics/inspect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          image: b64,
+          prompt: prompt,
+          model: "gemini-robotics-er-2-preview",
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        terminal.textContent = `Inspection error: ${data.error || "Unknown error"}`;
+        return;
+      }
+
+      terminal.textContent = data.raw_text;
+      if ($("robotics-latency-badge")) {
+        $("robotics-latency-badge").textContent = `${data.latency_ms}ms`;
+        $("robotics-latency-badge").classList.remove("hidden");
+      }
+
+      const boxes = data.boxes && data.boxes.length > 0 ? data.boxes : parseBoxesFromText(data.raw_text);
+      drawBoundingBoxes(boxes);
+    } catch (err) {
+      terminal.textContent = "Network error: " + err.message;
+    } finally {
+      inspectBtn.disabled = false;
+      inspectBtn.innerHTML = `<span>⚡ Inspect Current Frame</span>`;
+    }
+  });
+
+  $("btn-robotics-stream-toggle")?.addEventListener("click", async () => {
+    if (isConnected) {
+      userInitiatedDisconnect = true;
+      disconnectLiveSession();
+    }
+    switchTab("studio");
+    appendSystemNotice("Connecting Live WebSocket to gemini-robotics-er-2-streaming-preview...");
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    connectLiveSession(`${proto}//${location.host}/ws/live?model=gemini-robotics-er-2-streaming-preview`);
+  });
 
   // Initialize on page load
   syncStateFromServer();
