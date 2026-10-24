@@ -87,6 +87,17 @@ func TestToolsExecution(t *testing.T) {
 	if res["results"] == nil {
 		t.Errorf("web_search returned nil results: %v", res)
 	}
+
+	// 9. Tavily search test
+	apiKey := getTavilyAPIKey()
+	if apiKey != "" {
+		tRes, err := searchTavily(apiKey, "Go programming language", "basic")
+		if err != nil {
+			t.Errorf("searchTavily failed: %v", err)
+		} else if tRes["results"] == nil {
+			t.Errorf("searchTavily returned nil results: %v", tRes)
+		}
+	}
 }
 
 func TestCleanHTMLText(t *testing.T) {

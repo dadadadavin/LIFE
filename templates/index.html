@@ -394,6 +394,32 @@
             </div>
           </div>
 
+          <!-- Web Search & Intelligence Engine (Tavily AI) -->
+          <div class="bg-white rounded-md border border-[#e4e4df] p-5 flex flex-col gap-4">
+            <div class="border-b border-[#e4e4df] pb-2">
+              <h2 class="text-[14px] font-semibold text-[#1a1a19]">Web Search &amp; Intelligence Engine (Tavily AI)</h2>
+              <p class="text-[12px] text-[#666660]">Configure web research tools (Search, Article Extraction, and Multi-Page Crawling via app.tavily.com).</p>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <label class="block text-[12px] font-medium text-[#444440] mb-1">Web Search Provider</label>
+                <select name="web_search_provider" class="w-full px-3 py-1.5 rounded border border-[#d4d4ce] bg-white text-[12.5px]">
+                  <option value="tavily" {{if eq .Config.WebSearchProvider "tavily"}}selected{{end}}>Tavily AI (Advanced LLM Search &amp; Clean Extraction)</option>
+                  <option value="hybrid" {{if eq .Config.WebSearchProvider "hybrid"}}selected{{end}}>Hybrid (Tavily AI + DuckDuckGo + Wikipedia)</option>
+                  <option value="duckduckgo" {{if eq .Config.WebSearchProvider "duckduckgo"}}selected{{end}}>Local Multi-Source (DuckDuckGo + Google News + Wiki)</option>
+                </select>
+              </div>
+              <div>
+                <label class="block text-[12px] font-medium text-[#444440] mb-1">Tavily Search Depth</label>
+                <select name="tavily_search_depth" class="w-full px-3 py-1.5 rounded border border-[#d4d4ce] bg-white text-[12.5px]">
+                  <option value="advanced" {{if eq .Config.TavilySearchDepth "advanced"}}selected{{end}}>Advanced (In-depth analysis, direct answers, highest relevance)</option>
+                  <option value="basic" {{if eq .Config.TavilySearchDepth "basic"}}selected{{end}}>Basic (Fast, standard results)</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
           <!-- Server VAD & Proactivity -->
           <div class="bg-white rounded-md border border-[#e4e4df] p-5 flex flex-col gap-4">
             <div class="border-b border-[#e4e4df] pb-2">
@@ -784,6 +810,38 @@
             <button type="submit" class="px-4 py-1.5 rounded bg-[#1a1a19] text-white text-[12.5px] font-medium cursor-pointer">
               Save Key to .env
             </button>
+          </form>
+        </div>
+
+        <!-- Tavily AI Search Key -->
+        <div class="bg-white rounded-md border border-[#e4e4df] p-5 flex flex-col gap-4">
+          <div class="flex items-center justify-between border-b border-[#e4e4df] pb-3">
+            <div>
+              <h2 class="text-[14px] font-semibold text-[#1a1a19]">Tavily AI Intelligence Service (app.tavily.com)</h2>
+              <p class="text-[12px] text-[#666660]">Enables deep live web search, clean markdown webpage extraction, and multi-page domain crawling.</p>
+            </div>
+            <span class="text-[11px] font-mono px-2 py-0.5 rounded bg-[#e8f0f8] text-[#1f4b7a] border border-[#c9d9eb]">Tavily Search + Extract + Crawl</span>
+          </div>
+
+          <form hx-post="/htmx/config" hx-target="#tavily-save-status" hx-swap="innerHTML" class="flex flex-col gap-4">
+            <div>
+              <label class="block text-[12px] font-medium text-[#444440] mb-1">Tavily API Key (saved to config.json &amp; .env)</label>
+              <div class="flex items-center gap-2">
+                <input type="password" name="tavily_api_key" value="{{.Config.TavilyAPIKey}}" placeholder="tvly-dev-..."
+                  class="flex-1 px-3 py-1.5 rounded border border-[#d4d4ce] bg-[#f9f9f7] font-mono text-[12.5px]" />
+                <button type="submit" class="px-4 py-1.5 rounded bg-[#1a1a19] text-white text-[12.5px] font-medium cursor-pointer">
+                  Save Key
+                </button>
+                <button type="button" hx-post="/htmx/keys/test-tavily" hx-include="[name='tavily_api_key']" hx-target="#tavily-test-badge" hx-swap="innerHTML"
+                  class="px-3 py-1.5 rounded bg-white hover:bg-[#f2f2ee] text-[#1a1a19] border border-[#d4d4ce] text-[12.5px] font-medium cursor-pointer">
+                  Test Live
+                </button>
+              </div>
+            </div>
+            <div class="flex items-center gap-3">
+              <div id="tavily-save-status"></div>
+              <div id="tavily-test-badge"></div>
+            </div>
           </form>
         </div>
       </section>

@@ -104,6 +104,9 @@ type AppConfig struct {
 	AutoExtractMemory         bool     `json:"auto_extract_memory"`
 	ToolBehavior              string   `json:"tool_behavior"`   // "NON_BLOCKING" or "BLOCKING"
 	ToolScheduling            string   `json:"tool_scheduling"` // "WHEN_IDLE", "INTERRUPT", "SILENT"
+	TavilyAPIKey              string   `json:"tavily_api_key"`
+	WebSearchProvider         string   `json:"web_search_provider"` // "tavily", "duckduckgo", "hybrid"
+	TavilySearchDepth         string   `json:"tavily_search_depth"` // "advanced", "basic"
 	EnabledTools              []string `json:"enabled_tools"`
 	SystemInstruction         string   `json:"system_instruction"`
 }
@@ -151,10 +154,14 @@ func defaultConfig() AppConfig {
 		AutoExtractMemory:       true,
 		ToolBehavior:            "NON_BLOCKING",
 		ToolScheduling:          "WHEN_IDLE",
+		TavilyAPIKey:            os.Getenv("TAVILY_API_KEY"),
+		WebSearchProvider:       "tavily",
+		TavilySearchDepth:       "advanced",
 		EnabledTools: []string{
 			"get_mac_system_info",
 			"web_search",
 			"read_webpage",
+			"crawl_website",
 			"save_user_memory",
 			"search_user_memory",
 			"list_project_files",
@@ -200,20 +207,27 @@ func loadConfig() AppConfig {
 			cfg.VisionResolution = 1080
 		}
 		if cfg.BargeInThreshold == 0 {
-			cfg.BargeInThreshold = 3200
+			cfg.BargeInThreshold = 600
 		}
-		// Ensure new tools are registered if upgrading from 8-tool config
-		hasReadWeb := false
+		if cfg.TavilyAPIKey == "" {
+			cfg.TavilyAPIKey = os.Getenv("TAVILY_API_KEY")
+		}
+		if cfg.WebSearchProvider == "" {
+			cfg.WebSearchProvider = "tavily"
+		}
+		if cfg.TavilySearchDepth == "" {
+			cfg.TavilySearchDepth = "advanced"
+		}
+		// Ensure new tools are registered if upgrading
+		hasCrawl := false
 		for _, t := range cfg.EnabledTools {
-			if t == "read_webpage" {
-				hasReadWeb = true
+			if t == "crawl_website" {
+				hasCrawl = true
 				break
 			}
 		}
-		if !hasReadWeb && len(cfg.EnabledTools) >= 6 {
-			for _, extra := range []string{"read_webpage", "mac_clipboard", "open_url_or_app", "capture_mac_screen"} {
-				cfg.EnabledTools = append(cfg.EnabledTools, extra)
-			}
+		if !hasCrawl && len(cfg.EnabledTools) >= 6 {
+			cfg.EnabledTools = append(cfg.EnabledTools, "crawl_website")
 		}
 		return cfg
 	}
@@ -440,6 +454,7 @@ func buildFullSystemPrompt(cfg AppConfig, activeKeyName string) string {
 	if strings.TrimSpace(cfg.CustomVocabulary) != "" {
 		sb.WriteString(fmt.Sprintf("- Custom Vocabulary & Domain Terms (recognize these spellings accurately when spoken): %s\n", cfg.CustomVocabulary))
 	}
+	sb.WriteString(fmt.Sprintf("- Web Search & Intelligence Engine: %s (Depth: %s)\n", cfg.WebSearchProvider, cfg.TavilySearchDepth))
 	sb.WriteString(fmt.Sprintf("- Enabled Local Tools (%d): %s\n", len(cfg.EnabledTools), strings.Join(cfg.EnabledTools, ", ")))
 	sb.WriteString("- Note: If the user asks what model you are, what voice you use, or how you are built, state these exact facts directly.\n")
 	sb.WriteString("================================================")
@@ -489,6 +504,20 @@ func buildFullSystemPrompt(cfg AppConfig, activeKeyName string) string {
 // ==============================================================================
 // API Keys (.env)
 // ==============================================================================
+
+func getTavilyAPIKey() string {
+	cfg := loadConfig()
+	if cfg.TavilyAPIKey != "" {
+		return cfg.TavilyAPIKey
+	}
+	if v := strings.TrimSpace(os.Getenv("TAVILY_API_KEY")); v != "" {
+		return v
+	}
+	envMu.Lock()
+	defer envMu.Unlock()
+	envMap, _ := godotenv.Read(envPath)
+	return strings.Trim(strings.TrimSpace(envMap["TAVILY_API_KEY"]), `"'`)
+}
 
 type KeyInfo struct {
 	Name     string `json:"name"`

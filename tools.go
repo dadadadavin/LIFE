@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -76,6 +77,27 @@ var toolCatalog = []ToolSpec{
 				"url": {
 					Type:        genai.TypeString,
 					Description: "Full http:// or https:// URL to fetch and read.",
+				},
+			},
+			Required: []string{"url"},
+		},
+	},
+	{
+		Name:        "crawl_website",
+		Title:       "Tavily Website Deep Crawl",
+		Description: "Systematically crawl a website domain or documentation using Tavily to explore multiple subpages and extract structured knowledge.",
+		Category:    "web",
+		SampleArgs:  `{"url": "https://docs.tavily.com", "instructions": "Find Python SDK endpoints"}`,
+		Schema: &genai.Schema{
+			Type: genai.TypeObject,
+			Properties: map[string]*genai.Schema{
+				"url": {
+					Type:        genai.TypeString,
+					Description: "Target website or documentation URL to crawl.",
+				},
+				"instructions": {
+					Type:        genai.TypeString,
+					Description: "Optional focus instructions (e.g. 'Extract all pricing and API details').",
 				},
 			},
 			Required: []string{"url"},
@@ -366,14 +388,57 @@ func executeLocalTool(name string, args map[string]any) map[string]any {
 		if query == "" {
 			return map[string]any{"error": "query is required"}
 		}
-		return performDeepWebSearch(query)
+		cfg := loadConfig()
+		apiKey := getTavilyAPIKey()
+		if cfg.WebSearchProvider == "duckduckgo" || apiKey == "" {
+			return performDeepWebSearch(query)
+		}
+		depth := cfg.TavilySearchDepth
+		if depth == "" {
+			depth = "advanced"
+		}
+		tavilyRes, err := searchTavily(apiKey, query, depth)
+		if err != nil {
+			fmt.Printf("%s \033[33m[TAVILY WARNING]\033[0m Search error (%v), falling back to multi-source...\n", time.Now().Format("15:04:05"), err)
+			return performDeepWebSearch(query)
+		}
+		if cfg.WebSearchProvider == "hybrid" {
+			localRes := performDeepWebSearch(query)
+			if items, ok := localRes["results"].([]map[string]any); ok {
+				if tItems, ok := tavilyRes["results"].([]map[string]any); ok {
+					tavilyRes["results"] = append(tItems, items...)
+				}
+			}
+		}
+		return tavilyRes
 
 	case "read_webpage":
 		rawURL := strArg("url")
 		if rawURL == "" || (!strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://")) {
 			return map[string]any{"error": "valid http:// or https:// url is required"}
 		}
+		if apiKey := getTavilyAPIKey(); apiKey != "" {
+			if res, err := extractTavily(apiKey, []string{rawURL}); err == nil && len(res) > 0 {
+				return res
+			}
+		}
 		return fetchReadableWebpage(rawURL)
+
+	case "crawl_website":
+		rawURL := strArg("url")
+		if rawURL == "" || (!strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://")) {
+			return map[string]any{"error": "valid http:// or https:// url is required"}
+		}
+		apiKey := getTavilyAPIKey()
+		if apiKey == "" {
+			return map[string]any{"error": "Tavily API key is not configured. Set TAVILY_API_KEY in .env"}
+		}
+		instructions := strArg("instructions")
+		res, err := crawlTavily(apiKey, rawURL, instructions)
+		if err != nil {
+			return map[string]any{"error": fmt.Sprintf("crawl failed: %v", err)}
+		}
+		return res
 
 	case "list_project_files":
 		subdir := strings.TrimLeft(strArg("subdir"), "/")
@@ -1021,4 +1086,217 @@ func fetchReadableWebpage(rawURL string) map[string]any {
 
 func jsonUnmarshal(b []byte, v any) error {
 	return json.Unmarshal(b, v)
+}
+
+// ==============================================================================
+// Tavily AI Search, Extraction & Crawling Integration (app.tavily.com)
+// ==============================================================================
+
+func searchTavily(apiKey, query, depth string) (map[string]any, error) {
+	if depth == "" {
+		depth = "advanced"
+	}
+	reqBody := map[string]any{
+		"query":          query,
+		"search_depth":   depth,
+		"max_results":    5,
+		"include_answer": true,
+		"include_images": false,
+	}
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
+	}
+
+	client := &http.Client{Timeout: 8 * time.Second}
+	req, err := http.NewRequest("POST", "https://api.tavily.com/search", bytes.NewReader(jsonData))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("tavily status %d: %s", resp.StatusCode, string(b))
+	}
+
+	var parsed struct {
+		Answer  string `json:"answer"`
+		Results []struct {
+			Title   string  `json:"title"`
+			URL     string  `json:"url"`
+			Content string  `json:"content"`
+			Score   float64 `json:"score"`
+		} `json:"results"`
+		ResponseTime float64 `json:"response_time"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return nil, err
+	}
+
+	var results []map[string]any
+	for _, r := range parsed.Results {
+		content := r.Content
+		if len(content) > 1500 {
+			content = content[:1500] + "...[truncated]"
+		}
+		results = append(results, map[string]any{
+			"source":  "Tavily AI (Advanced)",
+			"title":   r.Title,
+			"url":     r.URL,
+			"snippet": content,
+			"score":   r.Score,
+		})
+	}
+
+	out := map[string]any{
+		"provider":      "Tavily AI",
+		"search_depth":  depth,
+		"query":         query,
+		"count":         len(results),
+		"results":       results,
+		"response_time": fmt.Sprintf("%.2fs", parsed.ResponseTime),
+		"tip":           "Use read_webpage or crawl_website for in-depth source extraction.",
+	}
+	if parsed.Answer != "" {
+		out["direct_answer"] = parsed.Answer
+	}
+	return out, nil
+}
+
+func extractTavily(apiKey string, urls []string) (map[string]any, error) {
+	reqBody := map[string]any{
+		"urls":          urls,
+		"extract_depth": "advanced",
+		"format":        "markdown",
+	}
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequest("POST", "https://api.tavily.com/extract", bytes.NewReader(jsonData))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("tavily extract status %d: %s", resp.StatusCode, string(b))
+	}
+
+	var parsed struct {
+		Results []struct {
+			URL        string `json:"url"`
+			Title      string `json:"title"`
+			RawContent string `json:"raw_content"`
+		} `json:"results"`
+		FailedResults []struct {
+			URL   string `json:"url"`
+			Error string `json:"error"`
+		} `json:"failed_results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return nil, err
+	}
+
+	if len(parsed.Results) == 0 {
+		return nil, fmt.Errorf("no extracted content")
+	}
+
+	first := parsed.Results[0]
+	content := first.RawContent
+	totalChars := len(content)
+	if len(content) > 5000 {
+		content = content[:5000] + "\n...[truncated]"
+	}
+
+	return map[string]any{
+		"provider":    "Tavily Extract (Markdown)",
+		"url":         first.URL,
+		"title":       first.Title,
+		"total_chars": totalChars,
+		"content":     content,
+	}, nil
+}
+
+func crawlTavily(apiKey, targetURL, instructions string) (map[string]any, error) {
+	reqBody := map[string]any{
+		"url":           targetURL,
+		"instructions":  instructions,
+		"max_depth":     1,
+		"limit":         5,
+		"extract_depth": "advanced",
+		"format":        "markdown",
+	}
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
+	}
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	req, err := http.NewRequest("POST", "https://api.tavily.com/crawl", bytes.NewReader(jsonData))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("tavily crawl status %d: %s", resp.StatusCode, string(b))
+	}
+
+	var parsed struct {
+		BaseURL string `json:"base_url"`
+		Results []struct {
+			URL        string `json:"url"`
+			RawContent string `json:"raw_content"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return nil, err
+	}
+
+	var crawled []map[string]any
+	for _, r := range parsed.Results {
+		snippet := r.RawContent
+		if len(snippet) > 800 {
+			snippet = snippet[:800] + "...[truncated]"
+		}
+		crawled = append(crawled, map[string]any{
+			"url":     r.URL,
+			"snippet": snippet,
+		})
+	}
+
+	return map[string]any{
+		"provider":     "Tavily Crawl",
+		"base_url":     parsed.BaseURL,
+		"pages_count":  len(crawled),
+		"pages":        crawled,
+		"instructions": instructions,
+	}, nil
 }

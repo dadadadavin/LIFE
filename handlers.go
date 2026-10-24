@@ -524,7 +524,8 @@ func registerRoutes(mux *http.ServeMux) {
 			case "model", "voice_name", "response_style", "system_instruction",
 				"activity_handling", "turn_coverage", "start_sensitivity", "end_sensitivity",
 				"tool_scheduling", "tool_behavior", "selected_key", "custom_vocabulary",
-				"transcription_mode", "stt_languages", "resume_session_id":
+				"transcription_mode", "stt_languages", "resume_session_id",
+				"tavily_api_key", "web_search_provider", "tavily_search_depth":
 				updates[key] = val
 			case "temperature", "video_fps":
 				if f, err := strconv.ParseFloat(val, 64); err == nil {
@@ -745,6 +746,27 @@ func registerRoutes(mux *http.ServeMux) {
 			writeHTML(w, fmt.Sprintf(`<span class="text-[11px] font-mono px-2 py-0.5 rounded bg-[#e6f3ec] text-[#1f5c3a] border border-[#bfe0ce]">Valid (%dms)</span>`, latencyMs))
 		} else {
 			writeHTML(w, fmt.Sprintf(`<span class="text-[11px] px-2 py-0.5 rounded bg-[#fae8e6] text-[#8a261d] border border-[#f2cbc6]" title="%s">Error</span>`, html.EscapeString(msg)))
+		}
+	})
+
+	mux.HandleFunc("POST /htmx/keys/test-tavily", func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		key := strings.TrimSpace(r.FormValue("tavily_api_key"))
+		if key == "" {
+			key = getTavilyAPIKey()
+		}
+		if key == "" {
+			writeHTML(w, `<span class="text-[11px] px-2 py-0.5 rounded bg-[#fae8e6] text-[#8a261d]">No key found</span>`)
+			return
+		}
+		start := time.Now()
+		res, err := searchTavily(key, "Samsung Innovation Campus", "basic")
+		lat := time.Since(start).Milliseconds()
+		if err != nil {
+			writeHTML(w, fmt.Sprintf(`<span class="text-[11px] px-2 py-0.5 rounded bg-[#fae8e6] text-[#8a261d] border border-[#f2cbc6]">Error: %s</span>`, html.EscapeString(err.Error())))
+		} else {
+			count, _ := res["count"].(int)
+			writeHTML(w, fmt.Sprintf(`<span class="text-[11px] font-mono px-2 py-0.5 rounded bg-[#e6f3ec] text-[#1f5c3a] border border-[#bfe0ce]">Valid (%dms, %d results)</span>`, lat, count))
 		}
 	})
 

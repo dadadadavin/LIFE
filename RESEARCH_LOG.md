@@ -60,5 +60,6 @@ To avoid asking the user to repeat facts, memory is split into:
 | Date | Codename | Focus Area | Outcome / Key Observation |
 | :--- | :--- | :--- | :--- |
 | **2026-10-12** | `greenfield` | Speech Barge-In & Pre-Roll Audio | Implemented 384ms pre-roll ring buffer, lowered barge-in threshold to 600 RMS, eliminated onset truncation, preserved transcription continuity. Best overall user experience achieved. |
+| **2026-10-24** | `tavily-intel` | Tavily Web Intelligence Engine | Integrated Tavily AI Advanced Search, clean markdown article extraction, and domain crawling with graceful fallback to multi-source search. Enhanced AI accuracy with direct answers and real-time facts. |
 | *Future* | *TBD* | Tool Scheduling (`WHEN_IDLE` vs `INTERRUPT`) | Evaluating UX trade-offs between asynchronous background tool execution and immediate vocal interruption. |
 | *Future* | *TBD* | Dynamic Rate-Limited Vision Ingestion | Investigating adaptive frame-rate scaling for screen capture based on UI motion detection. |

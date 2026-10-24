@@ -140,4 +140,17 @@ func TestHTMXEndpoints(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Errorf("POST /htmx/voice/select returned %d", w.Code)
 	}
+
+	// 6. POST /htmx/keys/test-tavily
+	tavilyForm := url.Values{"tavily_api_key": {"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"}}
+	req = httptest.NewRequest("POST", "/htmx/keys/test-tavily", strings.NewReader(tavilyForm.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("POST /htmx/keys/test-tavily returned %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "Valid") {
+		t.Errorf("POST /htmx/keys/test-tavily response did not indicate Valid: %s", w.Body.String())
+	}
 }
