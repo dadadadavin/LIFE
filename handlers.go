@@ -1047,27 +1047,51 @@ func registerRoutes(mux *http.ServeMux) {
 }
 
 func verifyAPIKey(apiKey string) (bool, int64, string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	testModels := []string{"gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-3.8-flash"}
+	var lastErr error
 
-	start := time.Now()
-	client, err := genai.NewClient(ctx, &genai.ClientConfig{
-		APIKey:  apiKey,
-		Backend: genai.BackendGeminiAPI,
-	})
-	if err != nil {
-		return false, 0, err.Error()
+	for _, modelName := range testModels {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		start := time.Now()
+		client, err := genai.NewClient(ctx, &genai.ClientConfig{
+			APIKey:  apiKey,
+			Backend: genai.BackendGeminiAPI,
+		})
+		if err != nil {
+			cancel()
+			return false, 0, err.Error()
+		}
+
+		resp, err := client.Models.GenerateContent(ctx, modelName, []*genai.Content{
+			{
+				Role:  "user",
+				Parts: []*genai.Part{{Text: "Reply with OK"}},
+			},
+		}, nil)
+		cancel()
+
+		if err == nil && resp != nil {
+			latency := time.Since(start).Milliseconds()
+			return true, latency, fmt.Sprintf("%s (%s)", strings.TrimSpace(resp.Text()), modelName)
+		}
+		lastErr = err
+
+		errStr := ""
+		if err != nil {
+			errStr = err.Error()
+		}
+		// If 503, immediately cascade to next test model
+		if strings.Contains(errStr, "503") || strings.Contains(errStr, "overloaded") || strings.Contains(errStr, "UNAVAILABLE") {
+			continue
+		}
+		// If invalid key error (400 or 403), stop immediately
+		if strings.Contains(errStr, "API_KEY_INVALID") || strings.Contains(errStr, "400") || strings.Contains(errStr, "403") {
+			break
+		}
 	}
 
-	resp, err := client.Models.GenerateContent(ctx, "gemini-3.8-flash", []*genai.Content{
-		{
-			Role:  "user",
-			Parts: []*genai.Part{{Text: "Reply with OK"}},
-		},
-	}, nil)
-	if err != nil {
-		return false, 0, err.Error()
+	if lastErr != nil {
+		return false, 0, lastErr.Error()
 	}
-	latency := time.Since(start).Milliseconds()
-	return true, latency, strings.TrimSpace(resp.Text())
+	return false, 0, "no response"
 }

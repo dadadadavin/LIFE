@@ -770,8 +770,18 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// extractMemoriesAndSummary runs after a session ends with automatic multi-key failover
-// and retry backoff to extract durable facts AND update the rolling "Last Session Summary".
+// MemoryRoutingModels defines the prioritized model cascade for background memory distillation and rolling summaries.
+// gemini-3.5-flash-lite is primary due to superior latency and high resilience against 503 spikes.
+var MemoryRoutingModels = []string{
+	"gemini-3.5-flash-lite", // Primary: ~1.5s, extremely high throughput, rarely overloaded
+	"gemini-3.6-flash",      // Secondary: next-gen fast flash
+	"gemini-3.7-flash",      // Tertiary: reasoning flash
+	"gemini-3.8-flash",      // Quaternary: 3.8 flash
+	"gemini-flash-lite-latest",
+}
+
+// extractMemoriesAndSummary runs after a session ends with intelligent model routing,
+// exponential backoff retry, and multi-key failover to ensure memories are never dropped.
 func extractMemoriesAndSummary(sessionID string, turns []TurnEntry, preferredKey string) {
 	var lines []string
 	for _, t := range turns {
@@ -803,52 +813,80 @@ Transcript:
 	}
 
 	var rawJSON string
+	var successfulModel string
+	var successfulKey string
 	var lastErr error
 
+KeyLoop:
 	for keyIdx, k := range keys {
-		for attempt := 0; attempt < 2; attempt++ {
-			if attempt > 0 {
-				time.Sleep(time.Duration(attempt) * 1200 * time.Millisecond)
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			client, err := genai.NewClient(ctx, &genai.ClientConfig{
-				APIKey:  k.Value,
-				Backend: genai.BackendGeminiAPI,
-			})
-			if err != nil {
+		ctx := context.Background()
+		client, err := genai.NewClient(ctx, &genai.ClientConfig{
+			APIKey:  k.Value,
+			Backend: genai.BackendGeminiAPI,
+		})
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		for _, modelName := range MemoryRoutingModels {
+			for attempt := 0; attempt < 2; attempt++ {
+				if attempt > 0 {
+					time.Sleep(time.Duration(attempt) * 900 * time.Millisecond)
+				}
+				reqCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				temp := float32(0.1)
+				resp, err := client.Models.GenerateContent(reqCtx, modelName, []*genai.Content{
+					{
+						Role:  "user",
+						Parts: []*genai.Part{{Text: prompt}},
+					},
+				}, &genai.GenerateContentConfig{
+					Temperature:      &temp,
+					ResponseMIMEType: "application/json",
+				})
 				cancel()
+
+				if err == nil && resp != nil {
+					text := strings.TrimSpace(resp.Text())
+					if text != "" {
+						rawJSON = text
+						successfulModel = modelName
+						successfulKey = k.Name
+						fmt.Printf("%s \033[32m[MEMORY ROUTING]\033[0m Distilled memories using %s (Key: %s)\n",
+							time.Now().Format("15:04:05"), modelName, k.Name)
+						break KeyLoop
+					}
+				}
+
 				lastErr = err
-				continue
-			}
+				errStr := ""
+				if err != nil {
+					errStr = err.Error()
+				}
 
-			temp := float32(0.1)
-			resp, err := client.Models.GenerateContent(ctx, "gemini-3.8-flash", []*genai.Content{
-				{
-					Role:  "user",
-					Parts: []*genai.Part{{Text: prompt}},
-				},
-			}, &genai.GenerateContentConfig{
-				Temperature:      &temp,
-				ResponseMIMEType: "application/json",
-			})
-			cancel()
-
-			if err == nil && resp != nil {
-				rawJSON = strings.TrimSpace(resp.Text())
-				if rawJSON != "" {
+				// If 503 Overloaded, immediately route to next model in cascade without wasting retry time
+				if strings.Contains(errStr, "503") || strings.Contains(errStr, "overloaded") || strings.Contains(errStr, "UNAVAILABLE") {
+					fmt.Printf("%s \033[33m[MEMORY ROUTING]\033[0m %s overloaded (503). Routing to next model in cascade...\n",
+						time.Now().Format("15:04:05"), modelName)
 					break
 				}
-			} else {
-				lastErr = err
-				fmt.Printf("%s \033[33m[MEMORY RETRY]\033[0m Key %s attempt %d error: %v\n",
-					time.Now().Format("15:04:05"), k.Name, attempt+1, err)
+
+				// If 429 Quota/Rate Limit on this key, failover to next key immediately
+				if strings.Contains(errStr, "429") || strings.Contains(errStr, "RESOURCE_EXHAUSTED") || strings.Contains(errStr, "quota") {
+					fmt.Printf("%s \033[33m[MEMORY FAILOVER]\033[0m Key %s quota exhausted. Switching key slot...\n",
+						time.Now().Format("15:04:05"), k.Name)
+					continue KeyLoop
+				}
+
+				// Otherwise log retry for transient drops
+				fmt.Printf("%s \033[33m[MEMORY RETRY]\033[0m Key %s (%s) attempt %d failed: %v\n",
+					time.Now().Format("15:04:05"), k.Name, modelName, attempt+1, err)
 			}
 		}
-		if rawJSON != "" {
-			break
-		}
+
 		if keyIdx < len(keys)-1 {
-			fmt.Printf("%s \033[33m[MEMORY FAILOVER]\033[0m Key %s failed, trying next key slot...\n",
+			fmt.Printf("%s \033[33m[MEMORY FAILOVER]\033[0m Key %s exhausted model cascade, trying next key slot...\n",
 				time.Now().Format("15:04:05"), k.Name)
 		}
 	}
@@ -896,8 +934,8 @@ Transcript:
 			fmt.Sprintf("auto:%s", sessionID),
 			true,
 		)
-		fmt.Printf("%s \033[35m[MEMORY]\033[0m Updated rolling session summary: \"%s\"\n",
-			time.Now().Format("15:04:05"), strings.TrimSpace(parsed.Summary))
+		fmt.Printf("%s \033[35m[MEMORY]\033[0m [%s via %s] Updated rolling session summary: \"%s\"\n",
+			time.Now().Format("15:04:05"), successfulModel, successfulKey, strings.TrimSpace(parsed.Summary))
 	}
 	for _, f := range parsed.Facts {
 		if strings.TrimSpace(f.Fact) != "" {
