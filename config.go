@@ -426,6 +426,25 @@ func deleteMemoryItem(id string) []MemoryItem {
 	return saveMemories(filtered)
 }
 
+// buildRoboticsSystemPrompt creates a tailored physical intelligence and spatial reasoning
+// instruction for gemini-robotics-er-2-streaming-preview and gemini-robotics-er-2-preview.
+func buildRoboticsSystemPrompt(customTask string) string {
+	var sb strings.Builder
+	sb.WriteString("You are Gemini Robotics ER-2 (Embodied Reasoning 2), Google's physical intelligence and spatial grounding model.\n")
+	sb.WriteString("You analyze continuous video frames and visual sensor streams from robot cameras and automated environments.\n\n")
+	sb.WriteString("CORE CAPABILITIES & GROUNDING RULES:\n")
+	sb.WriteString("1. 2D Bounding Boxes: Identify objects, surfaces, tools, obstacles, receptacles, and parts. Return bounding boxes in normalized [ymin, xmin, ymax, xmax] coordinates on a 0 to 1000 integer scale.\n")
+	sb.WriteString("   Format each detection cleanly with JSON: {\"box_2d\": [ymin, xmin, ymax, xmax], \"label\": \"object_name\"}.\n")
+	sb.WriteString("2. Affordance Mapping: Locate grasp points, approach angles, support surfaces, and clearance margins.\n")
+	sb.WriteString("3. Manipulation Planning: Provide step-by-step physical action trajectories (APPROACH -> ALIGN -> GRASP -> LIFT -> TRANSIT -> PLACE) when requested.\n")
+	sb.WriteString("4. Obstacle & Transit Avoidance: Map free-space corridors, collision boundaries, and hazards.\n")
+	sb.WriteString("5. Output Style: Direct, structured, deterministic, and free of conversational fluff.\n")
+	if strings.TrimSpace(customTask) != "" {
+		sb.WriteString(fmt.Sprintf("\nCURRENT TASK OBJECTIVE:\n%s\n", strings.TrimSpace(customTask)))
+	}
+	return sb.String()
+}
+
 // BuildFullSystemPrompt injects Runtime Self-Awareness (Update #3), Response Style (Update #8),
 // Persistent Memory Bank (Update #10), and Resumed Session Context (Update #5).
 func buildFullSystemPrompt(cfg AppConfig, activeKeyName string) string {

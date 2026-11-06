@@ -916,9 +916,11 @@ func registerRoutes(mux *http.ServeMux) {
 	// Robotics & Spatial Vision Inspection API
 	// ========================================================================
 	type RoboticsInspectRequest struct {
-		ImageBase64 string `json:"image"`
-		Prompt      string `json:"prompt"`
-		Model       string `json:"model"`
+		ImageBase64 string   `json:"image"`
+		Prompt      string   `json:"prompt"`
+		Model       string   `json:"model"`
+		Temperature *float32 `json:"temperature,omitempty"`
+		KeySlot     string   `json:"key_slot,omitempty"`
 	}
 
 	type BoundingBoxItem struct {
@@ -953,7 +955,11 @@ func registerRoutes(mux *http.ServeMux) {
 		}
 
 		cfg := loadConfig()
-		keys := getOrderedAPIKeys(cfg.SelectedKey, cfg.AutoKeyFailover)
+		preferredKey := cfg.SelectedKey
+		if req.KeySlot != "" {
+			preferredKey = req.KeySlot
+		}
+		keys := getOrderedAPIKeys(preferredKey, cfg.AutoKeyFailover)
 		if len(keys) == 0 {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "no API keys configured"})
 			return
@@ -962,6 +968,11 @@ func registerRoutes(mux *http.ServeMux) {
 		start := time.Now()
 		var respText string
 		var lastErr error
+
+		genConfig := &genai.GenerateContentConfig{}
+		if req.Temperature != nil {
+			genConfig.Temperature = req.Temperature
+		}
 
 		for _, k := range keys {
 			ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
@@ -990,7 +1001,7 @@ func registerRoutes(mux *http.ServeMux) {
 						},
 					},
 				},
-			}, nil)
+			}, genConfig)
 			cancel()
 
 			if err == nil && resp != nil {

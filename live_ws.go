@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -41,14 +42,16 @@ func buildLiveConnectConfig(cfg AppConfig, activeKeyName string) *genai.LiveConn
 	triggerTokens := cfg.TriggerTokens
 	targetTokens := cfg.TargetTokens
 
-	fullPrompt := buildFullSystemPrompt(cfg, activeKeyName)
-
 	isRobotics := strings.Contains(cfg.Model, "robotics")
 	var modalities []genai.Modality
+	var fullPrompt string
+
 	if isRobotics {
 		modalities = []genai.Modality{genai.ModalityText}
+		fullPrompt = buildRoboticsSystemPrompt(cfg.SystemInstruction)
 	} else {
 		modalities = []genai.Modality{genai.ModalityAudio}
+		fullPrompt = buildFullSystemPrompt(cfg, activeKeyName)
 	}
 
 	liveCfg := &genai.LiveConnectConfig{
@@ -79,6 +82,11 @@ func buildLiveConnectConfig(cfg AppConfig, activeKeyName string) *genai.LiveConn
 		}
 		liveCfg.InputAudioTranscription = &genai.AudioTranscriptionConfig{}
 		liveCfg.OutputAudioTranscription = &genai.AudioTranscriptionConfig{}
+
+		tools := buildGenAITools(cfg)
+		if len(tools) > 0 {
+			liveCfg.Tools = tools
+		}
 	}
 
 	if cfg.ProactiveAudio {
@@ -141,6 +149,17 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Query().Get("resume") == "true" {
 		cfg.ContinueLastSession = true
+	}
+	if pOverride := r.URL.Query().Get("prompt"); pOverride != "" {
+		cfg.SystemInstruction = pOverride
+	}
+	if tOverride := r.URL.Query().Get("temp"); tOverride != "" {
+		if val, err := strconv.ParseFloat(tOverride, 32); err == nil && val >= 0 {
+			cfg.Temperature = float32(val)
+		}
+	}
+	if kOverride := r.URL.Query().Get("key"); kOverride != "" {
+		cfg.SelectedKey = kOverride
 	}
 
 	fmt.Printf("\n%s \033[1;34m[WS CONNECT]\033[0m Client connected from %s (Model: %s, Voice: %s, Resume: %v)\n",
@@ -765,7 +784,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	if cfg.AutoExtractMemory && len(finalTurns) >= 2 {
+	if !strings.Contains(cfg.Model, "robotics") && cfg.AutoExtractMemory && len(finalTurns) >= 2 {
 		go extractMemoriesAndSummary(sessionID, finalTurns, cfg.SelectedKey)
 	}
 }

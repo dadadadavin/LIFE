@@ -151,6 +151,9 @@
     if (tabName === "tools" && window.htmx) {
       window.htmx.ajax("GET", "/htmx/notes", { target: "#notes-list-container", swap: "innerHTML" });
     }
+    if (tabName === "robotics") {
+      populateRoboticsCameras();
+    }
   }
 
   document.querySelectorAll(".nav-tab").forEach((btn) => {
@@ -1331,11 +1334,16 @@
   }, { once: true });
 
   // =========================================================================
-  // 12. Robotics ER-2 Playground Controller (Spatial Grounding & Bounding Boxes)
+  // 12. Robotics ER-2 Playground Controller (Independent Architecture)
   // =========================================================================
   let roboticsStream = null;
   let roboticsMode = null; // "cam" | "screen" | "image"
   let roboticsCurrentB64 = null;
+  let roboticsWs = null;
+  let roboticsIsConnected = false;
+  let roboticsFrameInterval = null;
+  let roboticsFramesSent = 0;
+  let roboticsAccumulatedText = "";
 
   const robColors = [
     { stroke: "#3b82f6", fill: "rgba(59, 130, 246, 0.25)", text: "#ffffff" },
@@ -1345,6 +1353,56 @@
     { stroke: "#8b5cf6", fill: "rgba(139, 92, 246, 0.25)", text: "#ffffff" },
     { stroke: "#06b6d4", fill: "rgba(6, 182, 212, 0.25)", text: "#ffffff" },
   ];
+
+  function setRoboticsStatus(state, message) {
+    const pill = $("robotics-status-pill");
+    const toggleBtn = $("btn-robotics-stream-toggle");
+    const label = $("btn-robotics-stream-label");
+    const txIndicator = $("robotics-tx-indicator");
+    const sendPromptBtn = $("btn-robotics-send-prompt");
+
+    if (!pill) return;
+
+    if (state === "connected") {
+      pill.className = "inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-medium bg-[#e6f3ec] text-[#1f5c3a] border border-[#bfe0ce]";
+      pill.innerHTML = `<span class="w-2 h-2 rounded-full bg-[#10b981] animate-pulse"></span> ${message || "Live ER-2 Connected"}`;
+      
+      if (toggleBtn) {
+        toggleBtn.className = "px-3.5 py-1.5 rounded-md font-medium text-[12px] bg-[#dc2626] hover:bg-[#b91c1c] text-white cursor-pointer transition-all flex items-center gap-2 shadow-xs";
+      }
+      if (label) label.textContent = "Disconnect Live Stream";
+      if (sendPromptBtn) sendPromptBtn.classList.remove("hidden");
+    } else if (state === "connecting") {
+      pill.className = "inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-medium bg-[#fffbeb] text-[#92400e] border border-[#fef3c7]";
+      pill.innerHTML = `<span class="w-2 h-2 rounded-full bg-[#f59e0b] animate-ping"></span> ${message || "Connecting..."}`;
+      
+      if (toggleBtn) {
+        toggleBtn.className = "px-3.5 py-1.5 rounded-md font-medium text-[12px] bg-[#d97706] text-white cursor-wait transition-all flex items-center gap-2 shadow-xs opacity-90";
+      }
+      if (label) label.textContent = "Connecting...";
+    } else {
+      pill.className = "inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-medium bg-[#f4f4f0] text-[#666660] border border-[#e4e4df]";
+      pill.innerHTML = `<span class="w-2 h-2 rounded-full bg-[#888880]"></span> ${message || "Disconnected"}`;
+      
+      if (toggleBtn) {
+        toggleBtn.className = "px-3.5 py-1.5 rounded-md font-medium text-[12px] bg-[#6366f1] hover:bg-[#4f46e5] text-white cursor-pointer transition-all flex items-center gap-2 shadow-xs";
+      }
+      if (label) label.textContent = "Connect Live Stream";
+      if (txIndicator) {
+        txIndicator.textContent = "Transmission: Idle";
+        txIndicator.className = "text-[10.5px] font-mono px-1.5 py-0.5 rounded bg-[#f4f4f0] text-[#777770] border border-[#e4e4df]";
+      }
+      if (sendPromptBtn) sendPromptBtn.classList.add("hidden");
+    }
+  }
+
+  function appendRoboticsTelemetry(msg) {
+    const term = $("robotics-telemetry-terminal");
+    if (!term) return;
+    const now = new Date().toTimeString().split(" ")[0];
+    term.textContent += `\n[${now}] ${msg}`;
+    term.scrollTop = term.scrollHeight;
+  }
 
   function drawBoundingBoxes(boxes) {
     const canvas = $("robotics-canvas");
@@ -1366,12 +1424,18 @@
       $("robotics-detection-count").textContent = `${boxes.length} objects detected`;
     }
 
+    // Config options from UI
+    const showLabels = $("robotics-show-labels")?.checked ?? true;
+    const showCoords = $("robotics-show-coords")?.checked ?? true;
+    const strokeWidth = parseFloat($("robotics-stroke-width")?.value || "2");
+    const fillAlpha = parseFloat($("robotics-fill-opacity")?.value || "0.25");
+
     // Render Box Pills
     if ($("robotics-boxes-list")) {
       let pillsHtml = "";
       boxes.forEach((b, idx) => {
         const color = robColors[idx % robColors.length];
-        const coordStr = b.box_2d ? `[${b.box_2d.join(", ")}]` : "";
+        const coordStr = (b.box_2d && showCoords) ? `[${b.box_2d.join(", ")}]` : "";
         pillsHtml += `<span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[11px] font-mono border" style="border-color:${color.stroke}; background-color:${color.fill}; color:${color.stroke}">
           <strong>${b.label || "Object"}</strong> <span class="opacity-80">${coordStr}</span>
         </span>`;
@@ -1390,30 +1454,39 @@
       const w = ((xmax - xmin) / 1000.0) * canvas.width;
       const h = ((ymax - ymin) / 1000.0) * canvas.height;
 
-      ctx.lineWidth = 2.5;
+      ctx.lineWidth = strokeWidth;
       ctx.strokeStyle = color.stroke;
-      ctx.fillStyle = color.fill;
+      
+      ctx.fillStyle = color.stroke + Math.round(fillAlpha * 255).toString(16).padStart(2, "0");
       ctx.fillRect(x, y, w, h);
       ctx.strokeRect(x, y, w, h);
 
-      const labelText = `${b.label || "Object"}`;
-      ctx.font = "bold 11px system-ui, -apple-system, sans-serif";
-      const textMetrics = ctx.measureText(labelText);
-      const pillW = textMetrics.width + 10;
-      const pillH = 18;
-      const pillY = Math.max(0, y - pillH);
+      if (showLabels) {
+        let labelText = `${b.label || "Object"}`;
+        if (showCoords) {
+          labelText += ` [${b.box_2d.join(",")}]`;
+        }
+        ctx.font = "bold 11px system-ui, -apple-system, sans-serif";
+        const textMetrics = ctx.measureText(labelText);
+        const pillW = textMetrics.width + 8;
+        const pillH = 16;
+        const pillY = Math.max(0, y - pillH);
 
-      ctx.fillStyle = color.stroke;
-      ctx.fillRect(x, pillY, pillW, pillH);
+        ctx.fillStyle = color.stroke;
+        ctx.fillRect(x, pillY, pillW, pillH);
 
-      ctx.fillStyle = color.text;
-      ctx.textBaseline = "middle";
-      ctx.fillText(labelText, x + 5, pillY + pillH / 2);
+        ctx.fillStyle = color.text;
+        ctx.textBaseline = "middle";
+        ctx.fillText(labelText, x + 4, pillY + pillH / 2);
+      }
     });
   }
 
   function parseBoxesFromText(text) {
     const boxes = [];
+    if (!text) return boxes;
+
+    // Pattern 1: JSON markdown codeblocks
     const jsonMatch = text.match(/```(?:json)?\s*(\[\s*\{[\s\S]*?\}\s*\])\s*```/);
     if (jsonMatch) {
       try {
@@ -1427,6 +1500,8 @@
         }
       } catch (_) {}
     }
+
+    // Pattern 2: Embedded object strings
     if (boxes.length === 0) {
       const re = /\{\s*"box_2d"\s*:\s*\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]\s*,\s*"label"\s*:\s*"([^"]+)"/g;
       let m;
@@ -1435,6 +1510,23 @@
           box_2d: [parseInt(m[1]), parseInt(m[2]), parseInt(m[3]), parseInt(m[4])],
           label: m[5],
         });
+      }
+    }
+
+    // Pattern 3: Array of objects without markdown fences
+    if (boxes.length === 0) {
+      const arrMatch = text.match(/\[\s*\{\s*"box_2d"[\s\S]*?\}\s*\]/);
+      if (arrMatch) {
+        try {
+          const parsed = JSON.parse(arrMatch[0]);
+          if (Array.isArray(parsed)) {
+            parsed.forEach((item) => {
+              if (item.box_2d && Array.isArray(item.box_2d) && item.box_2d.length === 4) {
+                boxes.push({ box_2d: item.box_2d, label: item.label || "object" });
+              }
+            });
+          }
+        } catch (_) {}
       }
     }
     return boxes;
@@ -1462,9 +1554,15 @@
       if (roboticsStream) {
         roboticsStream.getTracks().forEach((t) => t.stop());
       }
-      roboticsStream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 1280 }, height: { ideal: 720 } },
-      });
+      const deviceId = $("robotics-cam-device")?.value;
+      const constraints = {
+        video: {
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          deviceId: deviceId ? { exact: deviceId } : undefined,
+        },
+      };
+      roboticsStream = await navigator.mediaDevices.getUserMedia(constraints);
       const video = $("robotics-video");
       video.srcObject = roboticsStream;
       video.classList.remove("hidden");
@@ -1472,8 +1570,14 @@
       $("robotics-empty-state")?.classList.add("hidden");
       roboticsMode = "cam";
       $("btn-robotics-cam").textContent = "Stop Camera";
+      appendRoboticsTelemetry("Camera stream active.");
+      
+      if (roboticsIsConnected) {
+        startRoboticsFrameLoop();
+      }
     } catch (err) {
       alert("Failed to start camera for Robotics ER-2: " + err.message);
+      appendRoboticsTelemetry("Camera error: " + err.message);
     }
   }
 
@@ -1492,11 +1596,218 @@
       $("robotics-empty-state")?.classList.add("hidden");
       roboticsMode = "screen";
       $("btn-robotics-screen").textContent = "Stop Screen";
+      appendRoboticsTelemetry("Screen sharing stream active.");
+
+      if (roboticsIsConnected) {
+        startRoboticsFrameLoop();
+      }
     } catch (err) {
       alert("Screen sharing cancelled or unavailable: " + err.message);
+      appendRoboticsTelemetry("Screen share error: " + err.message);
     }
   }
 
+  function startRoboticsFrameLoop() {
+    stopRoboticsFrameLoop();
+    const fpsMs = parseInt($("robotics-fps-select")?.value || "1000", 10);
+    const txIndicator = $("robotics-tx-indicator");
+
+    if (fpsMs <= 0) {
+      if (txIndicator) {
+        txIndicator.textContent = "Transmission: Manual";
+        txIndicator.className = "text-[10.5px] font-mono px-1.5 py-0.5 rounded bg-[#f4f4f0] text-[#555550] border border-[#e4e4df]";
+      }
+      return;
+    }
+
+    if (txIndicator) {
+      const fpsVal = (1000 / fpsMs).toFixed(1);
+      txIndicator.textContent = `Streaming: ${fpsVal} FPS`;
+      txIndicator.className = "text-[10.5px] font-mono px-1.5 py-0.5 rounded bg-[#e6f3ec] text-[#1f5c3a] border border-[#bfe0ce]";
+    }
+
+    roboticsFrameInterval = setInterval(async () => {
+      if (!roboticsIsConnected || !roboticsWs || roboticsWs.readyState !== WebSocket.OPEN) {
+        stopRoboticsFrameLoop();
+        return;
+      }
+      const b64 = await captureRoboticsFrameJPEG();
+      if (b64) {
+        roboticsWs.send(JSON.stringify({
+          type: "image",
+          data: b64,
+          mime_type: "image/jpeg"
+        }));
+        roboticsFramesSent++;
+        if ($("robotics-frames-badge")) {
+          $("robotics-frames-badge").textContent = `${roboticsFramesSent} frames`;
+        }
+      }
+    }, fpsMs);
+  }
+
+  function stopRoboticsFrameLoop() {
+    if (roboticsFrameInterval) {
+      clearInterval(roboticsFrameInterval);
+      roboticsFrameInterval = null;
+    }
+  }
+
+  function sendRoboticsPrompt() {
+    if (!roboticsWs || roboticsWs.readyState !== WebSocket.OPEN) {
+      alert("Please connect Live Stream first.");
+      return;
+    }
+    const prompt = $("robotics-prompt-input")?.value;
+    if (!prompt) return;
+    roboticsWs.send(JSON.stringify({
+      type: "text",
+      text: prompt
+    }));
+    appendRoboticsTelemetry(`Dispatched user instruction: "${prompt}"`);
+  }
+
+  function connectRoboticsLive() {
+    if (roboticsWs) {
+      disconnectRoboticsLive();
+    }
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const model = $("robotics-model-select")?.value || "gemini-robotics-er-2-streaming-preview";
+    const temp = $("robotics-temp-slider")?.value || "0.2";
+    const prompt = encodeURIComponent($("robotics-prompt-input")?.value || "");
+    const url = `${proto}//${location.host}/ws/live?model=${encodeURIComponent(model)}&temp=${temp}&prompt=${prompt}&source=robotics`;
+
+    setRoboticsStatus("connecting", "Connecting to Live ER-2...");
+    appendRoboticsTelemetry(`Connecting WebSocket to ${model} (temp: ${temp})...`);
+
+    roboticsFramesSent = 0;
+    roboticsAccumulatedText = "";
+    if ($("robotics-frames-badge")) $("robotics-frames-badge").textContent = "0 frames";
+    if ($("robotics-model-badge")) $("robotics-model-badge").textContent = model;
+
+    roboticsWs = new WebSocket(url);
+
+    roboticsWs.onopen = () => {
+      roboticsIsConnected = true;
+      setRoboticsStatus("connected", "Live ER-2 Connected");
+      appendRoboticsTelemetry("WebSocket connected. Starting live grounding stream.");
+      
+      const promptVal = $("robotics-prompt-input")?.value || "Detect all objects and output 2D bounding boxes.";
+      roboticsWs.send(JSON.stringify({
+        type: "text",
+        text: promptVal
+      }));
+      appendRoboticsTelemetry(`Initial prompt dispatched: "${promptVal}"`);
+
+      startRoboticsFrameLoop();
+    };
+
+    roboticsWs.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        handleRoboticsLiveMessage(msg);
+      } catch (err) {
+        appendRoboticsTelemetry(`Parse error: ${err.message}`);
+      }
+    };
+
+    roboticsWs.onerror = (err) => {
+      appendRoboticsTelemetry(`WebSocket error event received.`);
+      setRoboticsStatus("error", "Connection error");
+    };
+
+    roboticsWs.onclose = (ev) => {
+      appendRoboticsTelemetry(`WebSocket closed (code: ${ev.code}, reason: ${ev.reason || "none"}).`);
+      disconnectRoboticsLive(false);
+    };
+  }
+
+  function disconnectRoboticsLive(sendCloseMsg = true) {
+    stopRoboticsFrameLoop();
+    if (roboticsWs) {
+      if (sendCloseMsg && roboticsWs.readyState === WebSocket.OPEN) {
+        try {
+          roboticsWs.send(JSON.stringify({ type: "disconnect" }));
+        } catch (_) {}
+        roboticsWs.close();
+      }
+      roboticsWs = null;
+    }
+    roboticsIsConnected = false;
+    setRoboticsStatus("disconnected", "Disconnected");
+    appendRoboticsTelemetry("Live stream disconnected.");
+  }
+
+  function handleRoboticsLiveMessage(msg) {
+    appendRoboticsTelemetry(`[${msg.type}] ` + JSON.stringify(msg).substring(0, 160));
+
+    switch (msg.type) {
+      case "connected":
+        if (msg.model && $("robotics-model-badge")) {
+          $("robotics-model-badge").textContent = msg.model;
+        }
+        break;
+
+      case "output_tx":
+        const terminal = $("robotics-output-terminal");
+        if (msg.full) {
+          roboticsAccumulatedText = msg.full;
+          if (terminal) terminal.textContent = msg.full;
+          const boxes = parseBoxesFromText(msg.full);
+          if (boxes.length > 0) {
+            drawBoundingBoxes(boxes);
+          }
+        } else if (msg.text) {
+          roboticsAccumulatedText += msg.text;
+          if (terminal) terminal.textContent = roboticsAccumulatedText;
+          const boxes = parseBoxesFromText(roboticsAccumulatedText);
+          if (boxes.length > 0) {
+            drawBoundingBoxes(boxes);
+          }
+        }
+        if (terminal) terminal.scrollTop = terminal.scrollHeight;
+        break;
+
+      case "turn_complete":
+        if (msg.latency_ms && $("robotics-latency-badge")) {
+          $("robotics-latency-badge").textContent = `${msg.latency_ms}ms`;
+          $("robotics-latency-badge").classList.remove("hidden");
+        }
+        break;
+
+      case "usage":
+        if ($("robotics-tokens-badge")) {
+          $("robotics-tokens-badge").textContent = `Tokens: ${msg.prompt_tokens} in / ${msg.response_tokens} out (${msg.total_tokens} total)`;
+          $("robotics-tokens-badge").classList.remove("hidden");
+        }
+        break;
+
+      case "error":
+        const term = $("robotics-output-terminal");
+        if (term) term.textContent += `\n[ERROR]: ${msg.message}`;
+        break;
+    }
+  }
+
+  async function populateRoboticsCameras() {
+    const sel = $("robotics-cam-device");
+    if (!sel || !navigator.mediaDevices?.enumerateDevices) return;
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videoDevices = devices.filter((d) => d.kind === "videoinput");
+      if (videoDevices.length > 0) {
+        sel.innerHTML = "";
+        videoDevices.forEach((dev, idx) => {
+          const opt = document.createElement("option");
+          opt.value = dev.deviceId;
+          opt.textContent = dev.label || `Camera ${idx + 1}`;
+          sel.appendChild(opt);
+        });
+      }
+    } catch (_) {}
+  }
+
+  // Event Listeners for Robotics UI
   $("btn-robotics-cam")?.addEventListener("click", () => {
     if (roboticsMode === "cam" && roboticsStream) {
       roboticsStream.getTracks().forEach((t) => t.stop());
@@ -1505,6 +1816,7 @@
       $("robotics-video")?.classList.add("hidden");
       $("robotics-empty-state")?.classList.remove("hidden");
       $("btn-robotics-cam").textContent = "Start Camera";
+      stopRoboticsFrameLoop();
       drawBoundingBoxes([]);
     } else {
       startRoboticsCamera();
@@ -1519,6 +1831,7 @@
       $("robotics-video")?.classList.add("hidden");
       $("robotics-empty-state")?.classList.remove("hidden");
       $("btn-robotics-screen").textContent = "Share Screen";
+      stopRoboticsFrameLoop();
       drawBoundingBoxes([]);
     } else {
       startRoboticsScreen();
@@ -1541,6 +1854,7 @@
       $("robotics-video")?.classList.add("hidden");
       $("robotics-empty-state")?.classList.add("hidden");
       drawBoundingBoxes([]);
+      appendRoboticsTelemetry(`Uploaded image frame (${(file.size / 1024).toFixed(1)} KB).`);
     };
     reader.readAsDataURL(file);
   });
@@ -1549,13 +1863,50 @@
     drawBoundingBoxes([]);
   });
 
+  $("btn-robotics-clear-terminal")?.addEventListener("click", () => {
+    if ($("robotics-output-terminal")) $("robotics-output-terminal").textContent = "";
+    if ($("robotics-telemetry-terminal")) $("robotics-telemetry-terminal").textContent = "-- Telemetry Cleared --";
+  });
+
   document.querySelectorAll(".btn-robotics-preset").forEach((btn) => {
     btn.addEventListener("click", () => {
       const p = btn.getAttribute("data-prompt");
       if ($("robotics-prompt-input")) {
         $("robotics-prompt-input").value = p;
       }
+      appendRoboticsTelemetry(`Preset selected: "${p.substring(0, 40)}..."`);
     });
+  });
+
+  $("robotics-temp-slider")?.addEventListener("input", (e) => {
+    if ($("robotics-temp-val")) $("robotics-temp-val").textContent = e.target.value;
+  });
+
+  $("robotics-show-labels")?.addEventListener("change", () => {
+    const boxes = parseBoxesFromText(roboticsAccumulatedText || $("robotics-output-terminal")?.textContent);
+    drawBoundingBoxes(boxes);
+  });
+  $("robotics-show-coords")?.addEventListener("change", () => {
+    const boxes = parseBoxesFromText(roboticsAccumulatedText || $("robotics-output-terminal")?.textContent);
+    drawBoundingBoxes(boxes);
+  });
+  $("robotics-stroke-width")?.addEventListener("change", () => {
+    const boxes = parseBoxesFromText(roboticsAccumulatedText || $("robotics-output-terminal")?.textContent);
+    drawBoundingBoxes(boxes);
+  });
+  $("robotics-fill-opacity")?.addEventListener("change", () => {
+    const boxes = parseBoxesFromText(roboticsAccumulatedText || $("robotics-output-terminal")?.textContent);
+    drawBoundingBoxes(boxes);
+  });
+
+  $("robotics-fps-select")?.addEventListener("change", () => {
+    if (roboticsIsConnected) {
+      startRoboticsFrameLoop();
+    }
+  });
+
+  $("btn-robotics-send-prompt")?.addEventListener("click", () => {
+    sendRoboticsPrompt();
   });
 
   $("btn-robotics-inspect")?.addEventListener("click", async () => {
@@ -1567,10 +1918,13 @@
     const prompt = $("robotics-prompt-input")?.value || "Detect all objects in 2D bounding boxes.";
     const terminal = $("robotics-output-terminal");
     const inspectBtn = $("btn-robotics-inspect");
+    const tempVal = parseFloat($("robotics-temp-slider")?.value || "0.2");
+    const model = $("robotics-model-select")?.value || "gemini-robotics-er-2-preview";
 
     inspectBtn.disabled = true;
     inspectBtn.innerHTML = `<span>⏳ Inspecting with ER-2...</span>`;
-    terminal.textContent = "Dispatching frame to gemini-robotics-er-2-preview...";
+    terminal.textContent = `Dispatching snapshot frame to ${model}...`;
+    appendRoboticsTelemetry(`Dispatching POST /api/robotics/inspect (${model})...`);
 
     try {
       const res = await fetch("/api/robotics/inspect", {
@@ -1579,16 +1933,21 @@
         body: JSON.stringify({
           image: b64,
           prompt: prompt,
-          model: "gemini-robotics-er-2-preview",
+          model: model.includes("preview") ? model : "gemini-robotics-er-2-preview",
+          temperature: tempVal,
         }),
       });
       const data = await res.json();
       if (!res.ok || data.error) {
         terminal.textContent = `Inspection error: ${data.error || "Unknown error"}`;
+        appendRoboticsTelemetry(`Inspection failed: ${data.error || "Unknown error"}`);
         return;
       }
 
+      roboticsAccumulatedText = data.raw_text;
       terminal.textContent = data.raw_text;
+      appendRoboticsTelemetry(`Inspection success: ${data.latency_ms}ms, ${data.boxes?.length || 0} boxes.`);
+
       if ($("robotics-latency-badge")) {
         $("robotics-latency-badge").textContent = `${data.latency_ms}ms`;
         $("robotics-latency-badge").classList.remove("hidden");
@@ -1598,24 +1957,39 @@
       drawBoundingBoxes(boxes);
     } catch (err) {
       terminal.textContent = "Network error: " + err.message;
+      appendRoboticsTelemetry("Network error: " + err.message);
     } finally {
       inspectBtn.disabled = false;
-      inspectBtn.innerHTML = `<span>⚡ Inspect Current Frame</span>`;
+      inspectBtn.innerHTML = `<span>⚡ Inspect Current Frame (REST)</span>`;
     }
   });
 
-  $("btn-robotics-stream-toggle")?.addEventListener("click", async () => {
-    if (isConnected) {
-      userInitiatedDisconnect = true;
-      disconnectLiveSession();
+  // Dedicated Live Stream Connect/Disconnect Toggle
+  $("btn-robotics-stream-toggle")?.addEventListener("click", () => {
+    if (roboticsIsConnected) {
+      disconnectRoboticsLive();
+    } else {
+      connectRoboticsLive();
     }
-    switchTab("studio");
-    appendSystemNotice("Connecting Live WebSocket to gemini-robotics-er-2-streaming-preview...");
-    const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    connectLiveSession(`${proto}//${location.host}/ws/live?model=gemini-robotics-er-2-streaming-preview`);
+  });
+
+  // Terminal Tab Switching
+  $("tab-btn-rob-reasoning")?.addEventListener("click", () => {
+    $("robotics-output-terminal")?.classList.remove("hidden");
+    $("robotics-telemetry-terminal")?.classList.add("hidden");
+    $("tab-btn-rob-reasoning").className = "text-[11px] font-semibold text-[#1a1a19] border-b-2 border-[#1a1a19] pb-0.5 cursor-pointer";
+    $("tab-btn-rob-telemetry").className = "text-[11px] text-[#777770] hover:text-[#1a1a19] pb-0.5 cursor-pointer";
+  });
+
+  $("tab-btn-rob-telemetry")?.addEventListener("click", () => {
+    $("robotics-output-terminal")?.classList.add("hidden");
+    $("robotics-telemetry-terminal")?.classList.remove("hidden");
+    $("tab-btn-rob-telemetry").className = "text-[11px] font-semibold text-[#1a1a19] border-b-2 border-[#1a1a19] pb-0.5 cursor-pointer";
+    $("tab-btn-rob-reasoning").className = "text-[11px] text-[#777770] hover:text-[#1a1a19] pb-0.5 cursor-pointer";
   });
 
   // Initialize on page load
   syncStateFromServer();
   populateHardwareDevices();
+  populateRoboticsCameras();
 })();

@@ -154,3 +154,51 @@ func TestHTMXEndpoints(t *testing.T) {
 		t.Errorf("POST /htmx/keys/test-tavily response did not indicate Valid: %s", w.Body.String())
 	}
 }
+
+func TestRoboticsPlaygroundIntegration(t *testing.T) {
+	mux := setupTestServer(t)
+
+	// 1. Verify Index page contains all decoupled robotics playground elements
+	req := httptest.NewRequest("GET", "/", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET / returned status %d", w.Code)
+	}
+	body := w.Body.String()
+	requiredElements := []string{
+		"tab-robotics",
+		"robotics-status-pill",
+		"btn-robotics-stream-toggle",
+		"robotics-cam-device",
+		"robotics-fps-select",
+		"robotics-telemetry-terminal",
+		"robotics-output-terminal",
+		"robotics-model-badge",
+		"robotics-frames-badge",
+	}
+	for _, el := range requiredElements {
+		if !strings.Contains(body, el) {
+			t.Errorf("Index page missing robotics element: %s", el)
+		}
+	}
+
+	// 2. Verify POST /api/robotics/inspect validation
+	badReq := httptest.NewRequest("POST", "/api/robotics/inspect", strings.NewReader(`{}`))
+	badReq.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, badReq)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("POST /api/robotics/inspect empty body expected 400, got %d", w.Code)
+	}
+
+	// 3. Verify robotics system prompt generation
+	robPrompt := buildRoboticsSystemPrompt("Test Task")
+	if !strings.Contains(robPrompt, "Embodied Reasoning") || !strings.Contains(robPrompt, "0 to 1000") {
+		t.Errorf("buildRoboticsSystemPrompt missing embodied reasoning directives")
+	}
+	if strings.Contains(robPrompt, "Active Voice Profile") {
+		t.Errorf("buildRoboticsSystemPrompt contains voice assistant contamination")
+	}
+}
