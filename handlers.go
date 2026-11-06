@@ -846,6 +846,11 @@ func registerRoutes(mux *http.ServeMux) {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "memories": items})
 	})
 
+	mux.HandleFunc("DELETE /api/memory", func(w http.ResponseWriter, r *http.Request) {
+		_ = saveMemories([]MemoryItem{})
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "memories": []any{}})
+	})
+
 	mux.HandleFunc("DELETE /api/memory/{id}", func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
 		deleteMemoryItem(id)
