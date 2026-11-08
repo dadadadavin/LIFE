@@ -1,6 +1,6 @@
 # Comprehensive Context Management Architecture in Lifel
 
-This document specifies the exact architecture of **Context**, **KV-Cache Lifecycles**, **System Instruction Assembly**, **Session Resumption**, and **Autonomous Memory Distillation** in Lifel. It reflects the production implementation powered by Google's **Gemini Multimodal Live API (`BidiGenerateContent`)** via the `google.golang.org/genai` Go SDK.
+This document specifies the complete, authoritative architecture of **Context Management**, **KV-Cache Lifecycles**, **System Instruction Assembly**, **Session Resumption**, **Tool Response Scheduling**, and **Autonomous Memory Distillation** in Lifel. It reflects the production implementation powered by Google's **Gemini Multimodal Live API (`BidiGenerateContent`)** via the `google.golang.org/genai` Go SDK.
 
 ---
 
@@ -47,15 +47,15 @@ Lifel is engineered as an **omnipresent, personal AI operating assistant for mac
 
 ## 2. Gemini Live Multimodal Context: The TPU KV-Cache
 
-In traditional REST APIs (e.g. `generateContent`), the client transmits the entire conversation history on every request, paying the quadratic attention and serialization penalty repeatedly.
+In traditional REST APIs (e.g. `generateContent`), the client transmits the entire conversation history on every request, paying quadratic attention and serialization penalties.
 
-In the **Gemini Multimodal Live API**, context is an **active, server-side Key-Value (KV) attention cache**:
+In the **Gemini Multimodal Live API (`BidiGenerateContent`)**, context is an **active, server-side Key-Value (KV) attention cache**:
 1. **Stateful In-Memory Session**: Once the connection opens via `client.Live.Connect()`, Google's TPU cluster allocates a dedicated KV-cache for the connection.
 2. **Streaming Token Ingestion**: Every millisecond of 16kHz audio, every 1080p camera/screen frame, and every tool result appends directly to this server-side cache.
 3. **Multimodal Cross-Attention**: Audio waveforms and visual embeddings reside in the same attention space, enabling Gemini to ground spoken pronouns (*"What is that chip on the breadboard?"*) in the visual frame streamed 500ms earlier.
 
 ### Live Token Rates on the Wire
-| Stream Channel | Token Generation Rate | Notes |
+| Stream Channel | Token Generation Rate | Engineering Implication |
 | :--- | :--- | :--- |
 | **User Mic (16kHz PCM)** | $\sim 25\text{--}35\text{ tokens/sec}$ | Ingested via `SendRealtimeInput` as raw PCM chunks. |
 | **Vision (Webcam / Screen)** | $\sim 258\text{ tokens/frame}$ | Ingested at 1.0–2.0 FPS as 1080p JPEG blobs. |
@@ -64,9 +64,25 @@ In the **Gemini Multimodal Live API**, context is an **active, server-side Key-V
 
 ---
 
-## 3. Handshake Payload Anatomy ($t = 0$)
+## 3. Official Gemini Live API Specifications vs. Lifel Architecture
 
-When you connect, Lifel constructs the initial `genai.LiveConnectConfig`. Before any microphone audio is streamed, Google receives two primary blocks that form the **Base Context**:
+To maintain a production-grade harness, Lifel strictly adheres to the official wire protocol of `google.golang.org/genai`:
+
+| Capability / Concept | Common Misconception | Actual Gemini Live API Wire Behavior | Lifel Production Implementation (`live_ws.go`) |
+| :--- | :--- | :--- | :--- |
+| **Warm Resumption TTL** | "Resumption handles expire in 5–15 minutes." | **Socket lifetime is $\sim 10$ minutes**, but **Resumption Handles are valid for 2 hours** after session termination. | Resumes via `SessionResumptionConfig{Handle: lastHandle}` up to 2 hours after disconnection at 0 extra tokens. |
+| **Resumption Update Handling** | "Always save `NewHandle` whenever update arrives." | `SessionResumptionUpdate` includes `Resumable bool` and `NewHandle string`. `NewHandle` is **empty** when `Resumable == false`. | Checks `update.Resumable && update.NewHandle != ""` before saving to avoid overwriting valid handles with `""`. |
+| **Long Session Continuity** | "30-minute calls stay on 1 WebSocket." | Single WebSocket connections drop at $\sim 10$ minutes with an `ABORTED` code. Server sends `GoAway` first. | Listens for `resp.GoAway != nil` with `TimeLeft`, broadcasts warning, and prepares warm auto-rotation. |
+| **Cold Session Resumption** | "Inject 20 old turns into System Instruction." | `SystemInstruction` is **permanently protected from Sliding Window eviction**, making old turns uncompressible. | Seeds historical turns into the mutable KV-cache via `session.SendClientContent` with `TurnComplete: false`. |
+| **Bilingual Speech-to-Text** | "STT is configured via text in System Prompt." | `gemini-3.8-live` processes audio natively; transcripts are enabled via `InputAudioTranscription` configs. | Configured via `LiveConnectConfig.RealtimeInputConfig` and `OutputAudioTranscription`. |
+| **Tool Response Scheduling** | "Gemini always pauses until tools return." | Live API supports `WHEN_IDLE`, `INTERRUPT`, and `SILENT` scheduling. | Uses `SILENT` for `save_user_memory` so memory is absorbed without audibly interrupting the speaker. |
+| **Interrupted Tool Calls** | "Tools always execute to completion." | When a user barges in mid-tool call, Google sends `LiveServerToolCallCancellation` with cancelled IDs. | Listens for `resp.ToolCallCancellation`, logs cancelled IDs, and suppresses stale responses. |
+
+---
+
+## 4. Handshake Payload Anatomy ($t = 0$)
+
+When you click **Connect**, Lifel constructs the initial `genai.LiveConnectConfig`. Before any microphone audio is streamed, Google receives two primary blocks that form the **Base Context**:
 1. **The System Instruction** ($\approx 750\text{--}850\text{ tokens}$)
 2. **The 13 Native Tool Function Declarations** ($\approx 1,250\text{ tokens}$)
 
@@ -118,16 +134,16 @@ You are Lifel, an advanced Jarvis-like personal AI operating assistant running n
 
 ---
 
-## 4. System Prompt Hygiene & Secret Protection
+## 5. System Prompt Hygiene & Secret Protection
 
 Lifel enforces strict **System Prompt Hygiene**:
 1. **No Internal Secret Leaks**: Active key slot aliases (such as `GEMINI_API_KEY_5`), API tokens, or environment variable identifiers are **never** injected into the LLM system prompt.
 2. **No Implementation Clutter**: Go compiler versions (`go1.24.0 darwin/arm64`) and web stack names (`HTMX`, `Tailwind CSS`) are excluded from general voice sessions. Feeding infrastructure secrets into every call wastes baseline tokens and causes "meta-slop" where the voice assistant unnecessarily mentions its tech stack.
-3. **Protected Sliding-Window Isolation**: Historical session turns are **never** injected into Layer 5 of `SystemInstruction`. Because `SystemInstruction` is permanently protected from server-side eviction, putting 20 turns of past dialogue in the system prompt makes stale history immortal and causes hallucinations (e.g., repeating hours-old battery levels without calling the tool). Historical context belongs in the mutable KV-cache via `SendClientContent` (see Section 8).
+3. **Protected Sliding-Window Isolation**: Historical session turns are **never** injected into Layer 5 of `SystemInstruction`. Because `SystemInstruction` is permanently protected from server-side eviction, putting 20 turns of past dialogue in the system prompt makes stale history immortal and causes hallucinations (e.g., repeating hours-old battery levels without calling the tool). Historical context belongs in the mutable KV-cache via `SendClientContent` (see Section 9).
 
 ---
 
-## 5. In-Flight Context Dynamics & Guardrails ($t > 0$)
+## 6. In-Flight Context Dynamics & Guardrails ($t > 0$)
 
 Once connected, context expands monotonically as the interaction proceeds:
 
@@ -160,6 +176,14 @@ Once connected, context expands monotonically as the interaction proceeds:
   └────────────────────────────────────────────────────────┘
 ```
 
+### The Screen-Share Math Problem & Vision Optimization
+* **The Math Problem**: Vision frames cost $\sim 258\text{ tokens/frame}$ at 1 FPS ($15,480\text{ tokens/minute}$).
+* At that rate, an active screen share hits the $80,000$ token compaction trigger in **only $\sim 5$ minutes**, and every subsequent 2.5 minutes of screen sharing will wipe out another $40,000$ tokens of conversation history!
+* **Lifel Mitigations**:
+  1. **On-Demand Native Capture**: The voice model proactively invokes `capture_mac_screen` when visual grounding is needed, capturing a native 1280p JPEG directly via macOS `screencapture`.
+  2. **Frame Throttling**: Video streams default to 1.0 FPS with optional lowering to 0.5 FPS during static desktop use.
+  3. **Visual Grounding without Spoken Interruption**: Frames are ingested as non-blocking `LiveRealtimeInput` video blobs.
+
 ### The 8,000-Character Payload Guardrail (`tools.go`)
 
 A single web search, webpage scrape, or file read could easily return 50,000 characters (over 12,000 tokens), instantly exhausting the context window and spiking latency.
@@ -172,14 +196,18 @@ In `tools.go`, Lifel applies a recursive payload guardrail via `truncateToolOutp
 
 ---
 
-## 6. Barge-In, Interruption & Tool Cancellation
+## 7. Barge-In, Interruption & Tool Cancellation
 
-When the user speaks while Gemini is talking or executing a tool:
-1. **Voice Activity Detection**: The client-side audio processor detects user speech and Google's server emits `ServerContent.Interrupted = true`.
-2. **Audio Buffer Flush**: Lifel instantly stops browser playback and flushes in-flight audio buffers.
-3. **Tool Call Cancellation Handling**:
-   * If Gemini issued a `ToolCall` and the user interrupts *before* the response is returned, Google transmits a **`LiveServerToolCallCancellation`** message with `IDs []string`.
-   * Lifel listens for `resp.ToolCallCancellation != nil`, logs the cancelled IDs, and avoids polluting the attention cache with abandoned tool outputs.
+### Voice Activity Detection (VAD) & Transcript Synchronization
+When the user speaks while Gemini is speaking or executing a tool:
+1. **Server Interruption Signal**: Google detects user speech (`START_OF_ACTIVITY_INTERRUPTS`) and transmits `ServerContent.Interrupted = true`.
+2. **Client Playback Buffer Purge**: The browser immediately flushes its Web Audio API buffer to stop speaker output instantly.
+3. **Transcript Accuracy**: In `live_ws.go`, the transcript recorder relies strictly on accumulated `OutputTranscription` chunks received up to the `Interrupted` signal, appending `[Interrupted]` to `turnsLog`. Sentences that Gemini planned to generate but was cut off from speaking are **never recorded**, preventing hallucinations in future memory distillation and cold resumption.
+
+### Tool Call Cancellation Handling (`LiveServerToolCallCancellation`)
+If a user says *"Check news on Apple M5—actually never mind, check my battery instead"* while Tavily or DuckDuckGo is executing in the background:
+1. Google emits a `LiveServerToolCallCancellation` message containing `IDs []string`.
+2. Lifel intercepts `resp.ToolCallCancellation != nil`, logs the cancelled IDs, and avoids sending stale `FunctionResponse` payloads that would otherwise pollute the server KV-cache.
 
 ### Tool Response Scheduling (`FunctionResponseScheduling`)
 
@@ -190,7 +218,7 @@ Gemini Live provides three scheduling modes for returning tool outputs:
 
 ---
 
-## 7. Server-Side Sliding Window Compaction
+## 8. Server-Side Sliding Window Compaction
 
 During long voice calls or continuous camera streaming, context can approach $100,000+$ tokens.
 
@@ -213,13 +241,13 @@ In `live_ws.go`, Lifel configures Google's server-side **Context Window Compress
                                                       40,000 Tokens (New Baseline)
 ```
 
-1. When the cumulative token count reaches **80,000**, the server evicts the oldest audio and tool tokens.
+1. When total tokens reach **80,000**, the server evicts the oldest audio and tool tokens.
 2. The initial **System Prompt**, **Memory Bank**, and **13 Tool Schemas** are **permanently protected** and never evicted.
 3. Total context drops back to **40,000 tokens** seamlessly without connection interruption or perceived lag.
 
 ---
 
-## 8. Two-Tier Resumption Architecture
+## 9. Two-Tier Resumption Architecture
 
 Past context survives interruptions, disconnects, and restarts through a two-tier strategy:
 
@@ -242,7 +270,6 @@ Past context survives interruptions, disconnects, and restarts through a two-tie
 ```
 
 ### The API Truth: Connection Lifetime vs. Resumption Handle TTL
-A common misconception is confusing the WebSocket socket limit with handle validity:
 * **WebSocket Connection Lifetime**: Google's servers enforce a maximum connection lifetime of **$\sim 10$ minutes per WebSocket**, after which the server terminates the socket with an `ABORTED` code.
 * **Resumption Handle TTL**: A `SessionResumptionUpdate` handle remains valid in Google's cache for **2 hours** after session termination.
 
@@ -259,7 +286,28 @@ A common misconception is confusing the WebSocket socket limit with handle valid
 ### `GoAway` Server Disconnect Signal & Auto-Rotation
 Before the 10-minute socket lifetime expires, Google transmits a **`LiveServerGoAway`** message containing `TimeLeft time.Duration`.
 * Lifel detects `resp.GoAway != nil`, logs the remaining duration, and broadcasts a `go_away` event to the web client.
-* The client prepares a seamless background reconnect using the latest valid resumption handle before the socket drops.
+* The client prepares a seamless background reconnect using the latest valid resumption handle before the socket drops:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Client as Browser / Client
+    participant Server as Go Server (live_ws.go)
+    participant TPU as Google TPU Cluster
+
+    Client->>Server: WebSocket Connected
+    Server->>TPU: client.Live.Connect(gemini-3.8-live)
+    Note over TPU,Server: Normal Spoken Turns & Vision Streaming
+    TPU-->>Server: LiveServerSessionResumptionUpdate{Resumable: true, NewHandle: "uuid-123"}
+    Server->>Server: Save uuid-123 to config.json
+    Note over TPU,Server: Connection reaches ~9.5 minutes
+    TPU-->>Server: LiveServerGoAway{TimeLeft: 30s}
+    Server-->>Client: WebSocket event {"type": "go_away", "time_left": "30s"}
+    Note over Client,Server: Client initiates seamless warm reconnect before 30s expires
+    Client->>Server: Connect (resume=true)
+    Server->>TPU: client.Live.Connect(Handle: "uuid-123")
+    TPU-->>Server: Session Resumed (0 Extra Tokens)
+```
 
 ### Tier B: Cold Resumption (Seeding via `SendClientContent`)
 If the session ended more than 2 hours ago, or the user selects a past session from days ago:
@@ -280,7 +328,7 @@ If the session ended more than 2 hours ago, or the user selects a past session f
 
 ---
 
-## 9. Autonomous Memory Distillation Loop (`memory.json`)
+## 10. Autonomous Memory Distillation Loop (`memory.json`)
 
 Transcripts in `sessions/*.json` are raw and verbose. To maintain durable facts across all future sessions without blowing up prompt tokens, Lifel uses a **Background Distillation Worker**.
 
@@ -303,9 +351,27 @@ Rather than blindly appending strings, Lifel sends **existing stored memories** 
 2. **Pinned Protection**: System-pinned facts (e.g. user OS, core preferences) are marked `[PINNED]` and protected from removal.
 3. **Hard Cap of 25 Items**: Dynamic facts are merged and capped at a maximum of **25 entries**. This guarantees that the Persistent User Memory Bank never consumes more than $\sim 400\text{--}500\text{ tokens}$ in the system prompt.
 
+#### Example of Contradiction Resolution in Practice:
+```json
+// BEFORE CALL (memory.json):
+[
+  {"category": "user", "content": "Lives in Jakarta, Indonesia", "pinned": false},
+  {"category": "preference", "content": "Prefers detailed terminal outputs", "pinned": true}
+]
+
+// TRANSCRIPT:
+// User: "Hey, I just relocated to Bandung for the new hardware lab."
+
+// AFTER CALL (Consolidated memory.json):
+[
+  {"category": "preference", "content": "Prefers detailed terminal outputs", "pinned": true},
+  {"category": "user", "content": "Lives in Bandung, Indonesia (relocated for hardware lab)", "pinned": false}
+]
+```
+
 ---
 
-## 10. Observability, Metrics & Telemetry
+## 11. Observability, Metrics & Telemetry
 
 Context consumption and live health can be verified in real time across three surfaces:
 
@@ -327,15 +393,16 @@ Context consumption and live health can be verified in real time across three su
 
 ---
 
-## 11. Context Architecture Comparison Matrix
+## 12. Context Architecture Comparison Matrix
 
-| Capability | Standard Chat APIs | Lifel Gemini Live Implementation |
+| Capability | Standard Chat REST APIs | Lifel Gemini Live Implementation |
 | :--- | :--- | :--- |
-| **Context Location** | Re-sent by client every HTTP request | Stateful Server KV-Cache on TPU cluster |
+| **Context Location** | Re-sent by client on every HTTP request | Stateful Server KV-Cache on TPU cluster |
 | **Multimodal Synchronization** | Disconnected images/text turns | Simultaneous cross-attention over voice & video |
 | **Max Call Duration** | Degrades linearly as tokens increase | 80k/40k Sliding Window keeps latency sub-100ms |
 | **Warm Resumption** | Not supported (full history re-sent) | Instant resume via 2-hour handle at **0 extra tokens** |
 | **Cold Resumption** | Injected into System Instruction | Seeded via `SendClientContent` into mutable cache |
+| **Connection Lifetime Rotation** | Manual reconnect loops | Handled via `GoAway` signal with `TimeLeft` |
 | **Tool Scheduling** | Model halts until tool returns | Configurable `WHEN_IDLE`, `INTERRUPT`, and `SILENT` |
 | **Tool Payload Safety** | Unchecked (vulnerable to prompt blowout) | 8,000-char truncation guardrail on every tool output |
 | **Long-Term Memory** | Static system prompt or raw RAG | Conflict-resolving Flash consolidation capped at 25 items |
