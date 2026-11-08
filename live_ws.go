@@ -113,11 +113,6 @@ func buildLiveConnectConfig(cfg AppConfig, activeKeyName string) *genai.LiveConn
 		}
 	}
 
-	tools := buildGenAITools(cfg)
-	if len(tools) > 0 {
-		liveCfg.Tools = tools
-	}
-
 	return liveCfg
 }
 
@@ -245,6 +240,26 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	defer session.Close()
 
+	var sessionWriteMu sync.Mutex
+	sendRealtimeSafe := func(in genai.LiveRealtimeInput) error {
+		sessionWriteMu.Lock()
+		defer sessionWriteMu.Unlock()
+		return session.SendRealtimeInput(in)
+	}
+	sendClientContentSafe := func(in genai.LiveClientContentInput) error {
+		sessionWriteMu.Lock()
+		defer sessionWriteMu.Unlock()
+		return session.SendClientContent(in)
+	}
+	sendToolResponseSafe := func(in genai.LiveToolResponseInput) error {
+		sessionWriteMu.Lock()
+		defer sessionWriteMu.Unlock()
+		return session.SendToolResponse(in)
+	}
+
+	var toolMu sync.Mutex
+	cancelledTools := make(map[string]bool)
+
 	fmt.Printf("%s \033[1;32m[GEMINI SUCCESS]\033[0m Live session ready! Model: %s | Voice: %s | Key: %s (WarmResumed: %v)\n",
 		time.Now().Format("15:04:05"), cfg.Model, cfg.VoiceName, connectedKeyName, didWarmResume)
 
@@ -264,23 +279,29 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 				startIdx = len(rec.Turns) - 20
 			}
 			for _, t := range rec.Turns[startIdx:] {
-				if t.Role == "tool" {
+				if t.Role == "tool" || strings.TrimSpace(t.Text) == "" {
 					continue
 				}
 				role := "user"
 				if t.Role == "model" {
 					role = "model"
 				}
-				histContent = append(histContent, &genai.Content{
-					Role:  role,
-					Parts: []*genai.Part{{Text: t.Text}},
-				})
+				// Coalesce adjacent turns with the same role to strictly maintain alternating turn semantics
+				if len(histContent) > 0 && histContent[len(histContent)-1].Role == role {
+					lastPart := histContent[len(histContent)-1].Parts[0]
+					lastPart.Text = strings.TrimSpace(lastPart.Text + "\n" + t.Text)
+				} else {
+					histContent = append(histContent, &genai.Content{
+						Role:  role,
+						Parts: []*genai.Part{{Text: t.Text}},
+					})
+				}
 			}
 			if len(histContent) > 0 {
 				turnComplete := false
 				fmt.Printf("%s \033[35m[COLD RESUMPTION]\033[0m Seeding %d historical turns into mutable context via SendClientContent (Session: %s)...\n",
 					time.Now().Format("15:04:05"), len(histContent), targetColdSessionID)
-				if err := session.SendClientContent(genai.LiveClientContentInput{
+				if err := sendClientContentSafe(genai.LiveClientContentInput{
 					Turns:        histContent,
 					TurnComplete: &turnComplete,
 				}); err != nil {
@@ -303,6 +324,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 	var turnsLog []TurnEntry
 	var latestResumptionHandle string
 	var latestUsage UsageStats
+	var sawGoAway bool
 
 	defer func() {
 		dur := time.Since(sessionStart).Seconds()
@@ -368,7 +390,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 					turnMu.Unlock()
 				}
 
-				_ = session.SendRealtimeInput(genai.LiveRealtimeInput{
+				_ = sendRealtimeSafe(genai.LiveRealtimeInput{
 					Audio: &genai.Blob{
 						Data:     pcmBytes,
 						MIMEType: "audio/pcm;rate=16000",
@@ -376,7 +398,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 				})
 
 			case "audio_stream_end":
-				_ = session.SendRealtimeInput(genai.LiveRealtimeInput{
+				_ = sendRealtimeSafe(genai.LiveRealtimeInput{
 					AudioStreamEnd: true,
 				})
 
@@ -395,7 +417,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 				}
 				fmt.Printf("%s \033[36m[VISION]\033[0m Ingested frame (%d bytes, %s)\n",
 					time.Now().Format("15:04:05"), len(jpegBytes), mimeType)
-				_ = session.SendRealtimeInput(genai.LiveRealtimeInput{
+				_ = sendRealtimeSafe(genai.LiveRealtimeInput{
 					Video: &genai.Blob{
 						Data:     jpegBytes,
 						MIMEType: mimeType,
@@ -429,7 +451,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 				})
 
 				turnComplete := true
-				_ = session.SendClientContent(genai.LiveClientContentInput{
+				_ = sendClientContentSafe(genai.LiveClientContentInput{
 					Turns: []*genai.Content{
 						{
 							Role:  "user",
@@ -442,6 +464,12 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 			case "ping":
 				_ = safeSend(map[string]any{"type": "pong", "ts": msg["ts"]})
 
+			case "warm_rotate":
+				logMu.Lock()
+				sawGoAway = true
+				logMu.Unlock()
+				return
+
 			case "disconnect":
 				return
 			}
@@ -451,6 +479,35 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Goroutine 2: Gemini Live -> Browser
 	go func() {
 		defer signalDone()
+
+		flushPendingUserTurn := func() {
+			turnMu.Lock()
+			if len(userTextBuf) == 0 {
+				turnMu.Unlock()
+				return
+			}
+			flushedUser := strings.TrimSpace(strings.Join(userTextBuf, ""))
+			userTextBuf = nil
+			turnMu.Unlock()
+
+			if flushedUser != "" {
+				nowStr := time.Now().Format("15:04:05")
+				fmt.Printf("%s \033[1;36m[USER]\033[0m %s\n", nowStr, flushedUser)
+				logMu.Lock()
+				turnsLog = append(turnsLog, TurnEntry{
+					Role: "user",
+					Text: flushedUser,
+					Time: nowStr,
+				})
+				logMu.Unlock()
+
+				_ = safeSend(map[string]any{
+					"type": "user_turn_finalized",
+					"text": flushedUser,
+				})
+			}
+		}
+
 		for {
 			resp, err := session.Receive()
 			if err != nil {
@@ -495,6 +552,9 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 			// Handle Server GoAway (Connection Lifetime Rotation ~10 minutes)
 			if resp.GoAway != nil {
 				timeLeft := resp.GoAway.TimeLeft
+				logMu.Lock()
+				sawGoAway = true
+				logMu.Unlock()
 				fmt.Printf("%s \033[1;33m[GEMINI GOAWAY]\033[0m Server requested disconnect. Time left: %v\n", time.Now().Format("15:04:05"), timeLeft)
 				_ = safeSend(map[string]any{
 					"type":         "go_away",
@@ -506,6 +566,11 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 			// Handle Tool Call Cancellation on User Barge-in / Interruption
 			if resp.ToolCallCancellation != nil && len(resp.ToolCallCancellation.IDs) > 0 {
 				cancelledIDs := resp.ToolCallCancellation.IDs
+				toolMu.Lock()
+				for _, id := range cancelledIDs {
+					cancelledTools[id] = true
+				}
+				toolMu.Unlock()
 				fmt.Printf("%s \033[33m[TOOL CANCELLED]\033[0m Server cancelled tool calls due to user interruption: %v\n", time.Now().Format("15:04:05"), cancelledIDs)
 				_ = safeSend(map[string]any{
 					"type":          "tool_call_cancellation",
@@ -583,38 +648,17 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 
 				// 2. Output Audio Transcription (Gemini spoken words)
 				if sc.OutputTranscription != nil && sc.OutputTranscription.Text != "" {
+					flushPendingUserTurn()
+
 					tx := sc.OutputTranscription.Text
-					var flushedUser string
 					turnMu.Lock()
-					if !modelSpeaking {
-						modelSpeaking = true
-						if len(userTextBuf) > 0 {
-							flushedUser = strings.TrimSpace(strings.Join(userTextBuf, ""))
-							userTextBuf = nil
-						}
-					}
+					modelSpeaking = true
 					if turnFirstByteLatencyMs == 0 && !lastUserActivity.IsZero() {
 						turnFirstByteLatencyMs = time.Since(lastUserActivity).Milliseconds()
 					}
 					modelTextBuf = append(modelTextBuf, tx)
 					fullModel := strings.TrimSpace(strings.Join(modelTextBuf, ""))
 					turnMu.Unlock()
-
-					if flushedUser != "" {
-						fmt.Printf("%s \033[1;36m[USER]\033[0m %s\n", time.Now().Format("15:04:05"), flushedUser)
-						logMu.Lock()
-						turnsLog = append(turnsLog, TurnEntry{
-							Role: "user",
-							Text: flushedUser,
-							Time: time.Now().Format("15:04:05"),
-						})
-						logMu.Unlock()
-
-						_ = safeSend(map[string]any{
-							"type": "user_turn_finalized",
-							"text": flushedUser,
-						})
-					}
 
 					_ = safeSend(map[string]any{
 						"type":  "output_tx",
@@ -626,6 +670,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 
 				// 3. Model Turn Parts (Audio for TTS models, Text for Robotics ER models)
 				if sc.ModelTurn != nil {
+					flushPendingUserTurn()
 					for _, part := range sc.ModelTurn.Parts {
 						if part.InlineData != nil && len(part.InlineData.Data) > 0 {
 							turnMu.Lock()
@@ -682,9 +727,9 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 
 				// 5. Turn Complete
 				if sc.TurnComplete {
+					flushPendingUserTurn()
+
 					turnMu.Lock()
-					flushedUser := strings.TrimSpace(strings.Join(userTextBuf, ""))
-					userTextBuf = nil
 					flushedModel := strings.TrimSpace(strings.Join(modelTextBuf, ""))
 					modelTextBuf = nil
 					modelSpeaking = false
@@ -694,14 +739,6 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 
 					nowStr := time.Now().Format("15:04:05")
 					logMu.Lock()
-					if flushedUser != "" {
-						fmt.Printf("%s \033[1;36m[USER]\033[0m %s\n", nowStr, flushedUser)
-						turnsLog = append(turnsLog, TurnEntry{
-							Role: "user",
-							Text: flushedUser,
-							Time: nowStr,
-						})
-					}
 					if flushedModel != "" {
 						fmt.Printf("%s \033[1;32m[GEMINI (%s)]\033[0m %s\n", nowStr, cfg.VoiceName, flushedModel)
 						turnsLog = append(turnsLog, TurnEntry{
@@ -719,13 +756,6 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 					fmt.Printf("%s \033[36m[LATENCY]\033[0m Turn latency: %dms | Tokens: prompt=%d, resp=%d, total=%d\n",
 						nowStr, latencyMs, promptTok, respTok, tokensTotal)
 
-					if flushedUser != "" {
-						_ = safeSend(map[string]any{
-							"type": "user_turn_finalized",
-							"text": flushedUser,
-						})
-					}
-
 					_ = safeSend(map[string]any{
 						"type":       "turn_complete",
 						"latency_ms": latencyMs,
@@ -733,94 +763,115 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			// 6. Tool Calls
+			// 6. Tool Calls (Dispatched asynchronously in a goroutine so session.Receive() stays unblocked for barge-in / cancellation)
 			if resp.ToolCall != nil && len(resp.ToolCall.FunctionCalls) > 0 {
-				var fnResponses []*genai.FunctionResponse
-				for _, fc := range resp.ToolCall.FunctionCalls {
-					argsMap := fc.Args
-					if argsMap == nil {
-						argsMap = map[string]any{}
-					}
-					argsJSON, _ := json.Marshal(argsMap)
-					fmt.Printf("%s \033[1;33m[TOOL CALL]\033[0m %s(%s)\n", time.Now().Format("15:04:05"), fc.Name, string(argsJSON))
+				flushPendingUserTurn()
 
-					_ = safeSend(map[string]any{
-						"type": "tool_call",
-						"id":   fc.ID,
-						"name": fc.Name,
-						"args": argsMap,
-					})
-
-					t0 := time.Now()
-					resultData := executeLocalTool(fc.Name, argsMap)
-					durTool := time.Since(t0)
-
-					// Update #10: Handle browser HD frame request & native macOS screen JPEG injection
-					if reqFrame, ok := resultData["_request_browser_hd_frame"].(bool); ok && reqFrame {
-						delete(resultData, "_request_browser_hd_frame")
-						_ = safeSend(map[string]any{"type": "request_hd_frame"})
-					}
-					if nativeB64, ok := resultData["_native_screen_b64"].(string); ok && nativeB64 != "" {
-						delete(resultData, "_native_screen_b64")
-						if jpegBytes, err := base64.StdEncoding.DecodeString(nativeB64); err == nil && len(jpegBytes) > 0 {
-							_ = session.SendRealtimeInput(genai.LiveRealtimeInput{
-								Video: &genai.Blob{
-									Data:     jpegBytes,
-									MIMEType: "image/jpeg",
-								},
-							})
+				go func(tc *genai.LiveServerToolCall) {
+					var fnResponses []*genai.FunctionResponse
+					for _, fc := range tc.FunctionCalls {
+						toolMu.Lock()
+						isCancelled := cancelledTools[fc.ID]
+						toolMu.Unlock()
+						if isCancelled {
+							fmt.Printf("%s \033[33m[TOOL SUPPRESSED]\033[0m %s (ID: %s) was cancelled before execution\n", time.Now().Format("15:04:05"), fc.Name, fc.ID)
+							continue
 						}
+
+						argsMap := fc.Args
+						if argsMap == nil {
+							argsMap = map[string]any{}
+						}
+						argsJSON, _ := json.Marshal(argsMap)
+						fmt.Printf("%s \033[1;33m[TOOL CALL]\033[0m %s(%s)\n", time.Now().Format("15:04:05"), fc.Name, string(argsJSON))
+
+						_ = safeSend(map[string]any{
+							"type": "tool_call",
+							"id":   fc.ID,
+							"name": fc.Name,
+							"args": argsMap,
+						})
+
+						t0 := time.Now()
+						resultData := executeLocalTool(fc.Name, argsMap)
+						durTool := time.Since(t0)
+
+						// Check if cancelled while executing
+						toolMu.Lock()
+						isCancelled = cancelledTools[fc.ID]
+						toolMu.Unlock()
+						if isCancelled {
+							fmt.Printf("%s \033[33m[TOOL SUPPRESSED]\033[0m %s (ID: %s) was cancelled during execution, suppressing response\n", time.Now().Format("15:04:05"), fc.Name, fc.ID)
+							continue
+						}
+
+						// Handle browser HD frame request & native macOS screen JPEG injection
+						if reqFrame, ok := resultData["_request_browser_hd_frame"].(bool); ok && reqFrame {
+							delete(resultData, "_request_browser_hd_frame")
+							_ = safeSend(map[string]any{"type": "request_hd_frame"})
+						}
+						if nativeB64, ok := resultData["_native_screen_b64"].(string); ok && nativeB64 != "" {
+							delete(resultData, "_native_screen_b64")
+							if jpegBytes, err := base64.StdEncoding.DecodeString(nativeB64); err == nil && len(jpegBytes) > 0 {
+								_ = sendRealtimeSafe(genai.LiveRealtimeInput{
+									Video: &genai.Blob{
+										Data:     jpegBytes,
+										MIMEType: "image/jpeg",
+									},
+								})
+							}
+						}
+
+						// Notify browser UI when memory or notes are updated via voice tool
+						if fc.Name == "save_user_memory" {
+							_ = safeSend(map[string]any{"type": "memory_updated"})
+						}
+						if fc.Name == "write_project_note" {
+							_ = safeSend(map[string]any{"type": "notes_updated"})
+						}
+
+						nowStr := time.Now().Format("15:04:05")
+						resJSON, _ := json.Marshal(resultData)
+						fmt.Printf("%s \033[33m[TOOL RESULT]\033[0m %s in %v -> %s\n",
+							nowStr, fc.Name, durTool.Truncate(100*time.Microsecond), string(resJSON))
+
+						logMu.Lock()
+						turnsLog = append(turnsLog, TurnEntry{
+							Role: "tool",
+							Text: fmt.Sprintf("%s(%s) -> %s", fc.Name, string(argsJSON), string(resJSON)),
+							Time: nowStr,
+						})
+						logMu.Unlock()
+
+						_ = safeSend(map[string]any{
+							"type":   "tool_result",
+							"id":     fc.ID,
+							"name":   fc.Name,
+							"result": resultData,
+						})
+
+						sched := genai.FunctionResponseScheduling(cfg.ToolScheduling)
+						if sched == "" {
+							sched = genai.FunctionResponseSchedulingWhenIdle
+						}
+						// Background memory persistence should be absorbed silently without vocally interrupting
+						if fc.Name == "save_user_memory" {
+							sched = genai.FunctionResponseSchedulingSilent
+						}
+						fnResponses = append(fnResponses, &genai.FunctionResponse{
+							ID:         fc.ID,
+							Name:       fc.Name,
+							Response:   map[string]any{"result": resultData},
+							Scheduling: sched,
+						})
 					}
 
-					// Update #7: Notify browser UI when memory or notes are updated via voice tool
-					if fc.Name == "save_user_memory" {
-						_ = safeSend(map[string]any{"type": "memory_updated"})
+					if len(fnResponses) > 0 {
+						_ = sendToolResponseSafe(genai.LiveToolResponseInput{
+							FunctionResponses: fnResponses,
+						})
 					}
-					if fc.Name == "write_project_note" {
-						_ = safeSend(map[string]any{"type": "notes_updated"})
-					}
-
-					nowStr := time.Now().Format("15:04:05")
-					resJSON, _ := json.Marshal(resultData)
-					fmt.Printf("%s \033[33m[TOOL RESULT]\033[0m %s in %v -> %s\n",
-						nowStr, fc.Name, durTool.Truncate(100*time.Microsecond), string(resJSON))
-
-					logMu.Lock()
-					turnsLog = append(turnsLog, TurnEntry{
-						Role: "tool",
-						Text: fmt.Sprintf("%s(%s) -> %s", fc.Name, string(argsJSON), string(resJSON)),
-						Time: nowStr,
-					})
-					logMu.Unlock()
-
-					_ = safeSend(map[string]any{
-						"type":   "tool_result",
-						"id":     fc.ID,
-						"name":   fc.Name,
-						"result": resultData,
-					})
-
-					sched := genai.FunctionResponseScheduling(cfg.ToolScheduling)
-					if sched == "" {
-						sched = genai.FunctionResponseSchedulingWhenIdle
-					}
-					// Background memory persistence should be absorbed silently without vocally interrupting
-					if fc.Name == "save_user_memory" {
-						sched = genai.FunctionResponseSchedulingSilent
-					}
-					fnResponses = append(fnResponses, &genai.FunctionResponse{
-						ID:         fc.ID,
-						Name:       fc.Name,
-						Response:   map[string]any{"result": resultData},
-						Scheduling: sched,
-					})
-				}
-
-				if len(fnResponses) > 0 {
-					_ = session.SendToolResponse(genai.LiveToolResponseInput{
-						FunctionResponses: fnResponses,
-					})
-				}
+				}(resp.ToolCall)
 			}
 		}
 	}()
@@ -864,7 +915,13 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	if !strings.Contains(cfg.Model, "robotics") && cfg.AutoExtractMemory && len(finalTurns) >= 2 {
+	logMu.Lock()
+	wasGoAway := sawGoAway
+	logMu.Unlock()
+
+	// Only trigger background memory distillation when the user actually closes the session,
+	// NOT during automated ~10-minute GoAway socket rotations
+	if !wasGoAway && !strings.Contains(cfg.Model, "robotics") && cfg.AutoExtractMemory && len(finalTurns) >= 2 {
 		go extractMemoriesAndSummary(sessionID, finalTurns, cfg.SelectedKey)
 	}
 }
@@ -899,38 +956,46 @@ func extractMemoriesAndSummary(sessionID string, turns []TurnEntry, preferredKey
 	}
 	convoText := strings.Join(lines, "\n")
 
-	// Read existing durable memory facts to allow contradiction resolution and deduplication
+	// Read existing memory bank: separate pinned facts (read-only context) from dynamic facts (mutable list)
 	existingMemories := loadMemories()
-	var existingFacts []string
+	var pinnedContext, dynamicFacts []string
 	for _, m := range existingMemories {
 		if m.Category == "summary" {
 			continue
 		}
-		pinnedTag := ""
 		if m.Pinned {
-			pinnedTag = "[PINNED] "
+			pinnedContext = append(pinnedContext, fmt.Sprintf("- [%s] %s", m.Category, m.Content))
+		} else {
+			dynamicFacts = append(dynamicFacts, fmt.Sprintf("- [%s] %s", m.Category, m.Content))
 		}
-		existingFacts = append(existingFacts, fmt.Sprintf("- %s[%s] %s", pinnedTag, m.Category, m.Content))
 	}
-	factsContext := "None recorded yet."
-	if len(existingFacts) > 0 {
-		factsContext = strings.Join(existingFacts, "\n")
+	pinnedStr := "None."
+	if len(pinnedContext) > 0 {
+		pinnedStr = strings.Join(pinnedContext, "\n")
+	}
+	dynamicStr := "None recorded yet."
+	if len(dynamicFacts) > 0 {
+		dynamicStr = strings.Join(dynamicFacts, "\n")
 	}
 
 	prompt := fmt.Sprintf(`You are the Memory Consolidation Engine for Lifel, an advanced Jarvis-like personal AI operating assistant.
-Review the user's currently stored memory bank and the transcript from their latest conversation.
+Review the user's stored memories and the transcript from their latest conversation.
 
-1. Current Stored Facts:
+1. Pinned Core Facts (Read-Only Context — DO NOT repeat, echo, or rephrase these in your output):
 %s
 
-2. Latest Voice Conversation Transcript:
+2. Current Dynamic Facts (Consolidate, update, or prune these):
+%s
+
+3. Latest Voice Conversation Transcript:
 %s
 
 Your task is to return a JSON object with:
 1. "summary": A crisp 1-2 sentence rolling summary of what was accomplished or discussed in this session.
-2. "facts": A consolidated, deduplicated, contradiction-resolved list of at most 20 durable facts about the User (preferences, project context, hardware, habits).
-   - Retain existing valid facts unless contradicted or superseded by new information in the transcript.
-   - If an old fact is contradicted or changed (e.g. new location, new tool, updated preference), replace it with the updated fact.
+2. "facts": A consolidated, deduplicated, contradiction-resolved list of at most 20 durable dynamic facts about the User (preferences, project context, hardware, habits).
+   - DO NOT repeat or rephrase any Pinned Core Facts from Section 1 in your output.
+   - Retain existing dynamic facts unless contradicted or superseded by new information in the transcript.
+   - If an old dynamic fact is contradicted or changed (e.g. new location, new tool, updated preference), replace it with the updated fact.
    - Extract new high-signal personal/project facts from the transcript.
    - Categorize each as "preference", "project", "user", or "task".
    - Discard trivial, fleeting chatter or temporary statuses.
@@ -941,7 +1006,7 @@ Return strictly valid JSON:
   "facts": [
     {"fact": "...", "category": "preference|project|user|task"}
   ]
-}`, factsContext, convoText)
+}`, pinnedStr, dynamicStr, convoText)
 
 	keys := getOrderedAPIKeys(preferredKey, true)
 	if len(keys) == 0 {
@@ -1096,10 +1161,12 @@ KeyLoop:
 		if cat == "" {
 			cat = "fact"
 		}
-		// Skip if already represented in pinned items
+		// Skip if already represented in or duplicates any pinned item
 		isPinned := false
+		lowerFact := strings.ToLower(factText)
 		for _, p := range pinnedItems {
-			if strings.EqualFold(strings.TrimSpace(p.Content), factText) {
+			lowerPin := strings.ToLower(strings.TrimSpace(p.Content))
+			if lowerPin == lowerFact || strings.Contains(lowerFact, lowerPin) || strings.Contains(lowerPin, lowerFact) {
 				isPinned = true
 				break
 			}
