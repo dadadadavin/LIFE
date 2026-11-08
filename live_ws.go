@@ -322,9 +322,32 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	var logMu sync.Mutex
 	var turnsLog []TurnEntry
+	var lastIndexedTurnIdx int
 	var latestResumptionHandle string
 	var latestUsage UsageStats
 	var sawGoAway bool
+
+	// Trigger A: Pre-Compaction Mid-Call Checkpoint
+	// Every 16 turns or when TotalTokenCount crosses 55,000, slice unindexed turns and consolidate in background
+	checkAndTriggerRAGCompaction := func() {
+		logMu.Lock()
+		unindexedCount := len(turnsLog) - lastIndexedTurnIdx
+		shouldTrigger := (unindexedCount >= 16) || (latestUsage.TotalTokens >= 55000 && unindexedCount > 0)
+		var batch []TurnEntry
+		if shouldTrigger && unindexedCount > 0 {
+			batch = make([]TurnEntry, unindexedCount)
+			copy(batch, turnsLog[lastIndexedTurnIdx:])
+			lastIndexedTurnIdx = len(turnsLog)
+		}
+		currentTokens := latestUsage.TotalTokens
+		logMu.Unlock()
+
+		if len(batch) > 0 && cfg.AutoExtractMemory && !strings.Contains(cfg.Model, "robotics") {
+			fmt.Printf("%s \033[35m[RAG TRIGGER A]\033[0m Pre-compaction checkpoint: %d turns dispatched (TotalTokens: %d)\n",
+				time.Now().Format("15:04:05"), len(batch), currentTokens)
+			go consolidateTranscriptBatch(sessionID, batch, connectedKeyName)
+		}
+	}
 
 	defer func() {
 		dur := time.Since(sessionStart).Seconds()
@@ -439,6 +462,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 					Time: nowStr,
 				})
 				logMu.Unlock()
+				checkAndTriggerRAGCompaction()
 
 				turnMu.Lock()
 				lastUserActivity = time.Now()
@@ -500,6 +524,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 					Time: nowStr,
 				})
 				logMu.Unlock()
+				checkAndTriggerRAGCompaction()
 
 				_ = safeSend(map[string]any{
 					"type": "user_turn_finalized",
@@ -588,6 +613,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 				logMu.Lock()
 				latestUsage = u
 				logMu.Unlock()
+				checkAndTriggerRAGCompaction()
 				_ = safeSend(map[string]any{
 					"type":            "usage",
 					"prompt_tokens":   u.PromptTokens,
@@ -752,6 +778,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 					promptTok := latestUsage.PromptTokens
 					respTok := latestUsage.ResponseTokens
 					logMu.Unlock()
+					checkAndTriggerRAGCompaction()
 
 					fmt.Printf("%s \033[36m[LATENCY]\033[0m Turn latency: %dms | Tokens: prompt=%d, resp=%d, total=%d\n",
 						nowStr, latencyMs, promptTok, respTok, tokensTotal)
@@ -782,6 +809,16 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 						if argsMap == nil {
 							argsMap = map[string]any{}
 						}
+						isMemoryMutate := false
+						if fc.Name == "memory" {
+							argsMap["_preferred_key"] = connectedKeyName
+							action, _ := argsMap["action"].(string)
+							action = strings.ToLower(strings.TrimSpace(action))
+							if action == "remember" || action == "update" || action == "forget" {
+								argsMap["_async"] = true
+								isMemoryMutate = true
+							}
+						}
 						argsJSON, _ := json.Marshal(argsMap)
 						fmt.Printf("%s \033[1;33m[TOOL CALL]\033[0m %s(%s)\n", time.Now().Format("15:04:05"), fc.Name, string(argsJSON))
 
@@ -805,25 +842,8 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 							continue
 						}
 
-						// Handle browser HD frame request & native macOS screen JPEG injection
-						if reqFrame, ok := resultData["_request_browser_hd_frame"].(bool); ok && reqFrame {
-							delete(resultData, "_request_browser_hd_frame")
-							_ = safeSend(map[string]any{"type": "request_hd_frame"})
-						}
-						if nativeB64, ok := resultData["_native_screen_b64"].(string); ok && nativeB64 != "" {
-							delete(resultData, "_native_screen_b64")
-							if jpegBytes, err := base64.StdEncoding.DecodeString(nativeB64); err == nil && len(jpegBytes) > 0 {
-								_ = sendRealtimeSafe(genai.LiveRealtimeInput{
-									Video: &genai.Blob{
-										Data:     jpegBytes,
-										MIMEType: "image/jpeg",
-									},
-								})
-							}
-						}
-
 						// Notify browser UI when memory or notes are updated via voice tool
-						if fc.Name == "save_user_memory" {
+						if fc.Name == "memory" || fc.Name == "save_user_memory" {
 							_ = safeSend(map[string]any{"type": "memory_updated"})
 						}
 						if fc.Name == "write_project_note" {
@@ -842,6 +862,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 							Time: nowStr,
 						})
 						logMu.Unlock()
+						checkAndTriggerRAGCompaction()
 
 						_ = safeSend(map[string]any{
 							"type":   "tool_result",
@@ -855,8 +876,10 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 							sched = genai.FunctionResponseSchedulingWhenIdle
 						}
 						// Background memory persistence should be absorbed silently without vocally interrupting
-						if fc.Name == "save_user_memory" {
+						if fc.Name == "save_user_memory" || (fc.Name == "memory" && isMemoryMutate) {
 							sched = genai.FunctionResponseSchedulingSilent
+						} else if fc.Name == "memory" && !isMemoryMutate {
+							sched = genai.FunctionResponseSchedulingWhenIdle
 						}
 						fnResponses = append(fnResponses, &genai.FunctionResponse{
 							ID:         fc.ID,
@@ -917,12 +940,21 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	logMu.Lock()
 	wasGoAway := sawGoAway
+	unindexedCount := len(turnsLog) - lastIndexedTurnIdx
+	var remainingTurns []TurnEntry
+	if unindexedCount > 0 {
+		remainingTurns = make([]TurnEntry, unindexedCount)
+		copy(remainingTurns, turnsLog[lastIndexedTurnIdx:])
+		lastIndexedTurnIdx = len(turnsLog)
+	}
 	logMu.Unlock()
 
-	// Only trigger background memory distillation when the user actually closes the session,
-	// NOT during automated ~10-minute GoAway socket rotations
-	if !wasGoAway && !strings.Contains(cfg.Model, "robotics") && cfg.AutoExtractMemory && len(finalTurns) >= 2 {
-		go extractMemoriesAndSummary(sessionID, finalTurns, cfg.SelectedKey)
+	// Trigger B (True Call Termination): When WebSocket closes and !sawGoAway is confirmed
+	// (ignoring ~10-minute GoAway warm rotations), run final consolidation pass over all remaining unindexed turns
+	if !wasGoAway && len(remainingTurns) > 0 && cfg.AutoExtractMemory && !strings.Contains(cfg.Model, "robotics") {
+		fmt.Printf("%s \033[35m[RAG TRIGGER B]\033[0m Final call termination pass: consolidating %d remaining turns\n",
+			time.Now().Format("15:04:05"), len(remainingTurns))
+		go consolidateTranscriptBatch(sessionID, remainingTurns, connectedKeyName)
 	}
 }
 

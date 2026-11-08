@@ -162,17 +162,15 @@ func defaultConfig() AppConfig {
 			"web_search",
 			"read_webpage",
 			"crawl_website",
-			"save_user_memory",
-			"search_user_memory",
+			"memory",
 			"list_project_files",
 			"read_project_file",
 			"write_project_note",
 			"calculate_math",
 			"mac_clipboard",
 			"open_url_or_app",
-			"capture_mac_screen",
 		},
-		SystemInstruction: "You are Lifel, an advanced Jarvis-like personal AI operating assistant running natively on the user's Mac. Always respond in the same language the user speaks (English or Indonesian). Keep your spoken answers crisp, natural, direct, and intelligent with zero conversational fluff. When asked to perform actions, check Mac status, search the live web, inspect files, capture the screen, or save notes and memories, execute the appropriate tools proactively and smoothly.",
+		SystemInstruction: "You are Lifel, an advanced Jarvis-like personal AI operating assistant running natively on macOS. Always respond in the same language the user speaks (English or Indonesian). Keep spoken responses crisp, natural, direct, and intelligent with zero conversational fluff. You possess deep episodic, technical, and project knowledge stored in a local semantic RAG engine. Proactively invoke the 'memory' tool with action='recall' whenever the conversation touches on past projects, hardware setups, user preferences, or multi-step tasks to retrieve full context before answering. Execute native Mac tools smoothly and proactively.",
 	}
 }
 
@@ -229,6 +227,27 @@ func loadConfig() AppConfig {
 		if !hasCrawl && len(cfg.EnabledTools) >= 6 {
 			cfg.EnabledTools = append(cfg.EnabledTools, "crawl_website")
 		}
+
+		// Sanitize enabled tools: migrate deprecated tools to unified memory and strip screen capture
+		var cleanTools []string
+		hasMemory := false
+		for _, t := range cfg.EnabledTools {
+			if t == "capture_mac_screen" {
+				continue
+			}
+			if t == "save_user_memory" || t == "search_user_memory" || t == "memory" {
+				if !hasMemory {
+					cleanTools = append(cleanTools, "memory")
+					hasMemory = true
+				}
+				continue
+			}
+			cleanTools = append(cleanTools, t)
+		}
+		if !hasMemory {
+			cleanTools = append(cleanTools, "memory")
+		}
+		cfg.EnabledTools = cleanTools
 		return cfg
 	}
 
@@ -474,22 +493,23 @@ func buildFullSystemPrompt(cfg AppConfig, activeKeyName string) string {
 		sb.WriteString(fmt.Sprintf("- Custom Vocabulary & Domain Terms: %s\n", cfg.CustomVocabulary))
 	}
 	sb.WriteString(fmt.Sprintf("- Enabled Native Tools (%d): %s\n", len(cfg.EnabledTools), strings.Join(cfg.EnabledTools, ", ")))
+	sb.WriteString("- Proactive Memory Directive: Detailed episodic history, architectural decisions, and technical specifications are stored in your local RAG index. Proactively call memory(action='recall', query='...') whenever the user mentions past discussions, project context, hardware details, or user preferences.\n")
 	sb.WriteString("- Operating Directive: Act like Jarvis—proactive, razor-sharp, helpful, and concise. Never leak internal API keys, slot names, or low-level web framework details.\n")
 	sb.WriteString("================================")
 
-	// Persistent User Memory Bank
+	// Layer 4: Persistent Core Identity & Active Projects (Strictly under 400 tokens)
 	if cfg.InjectMemory {
-		memories := loadMemories()
-		if len(memories) > 0 {
-			sb.WriteString("\n\n=== PERSISTENT USER MEMORY BANK ===\n")
-			for _, m := range memories {
-				pinTag := ""
-				if m.Pinned {
-					pinTag = "[PINNED] "
-				}
-				sb.WriteString(fmt.Sprintf("- %s[%s] %s\n", pinTag, strings.ToUpper(m.Category), m.Content))
+		pinnedItems, projectIndex := getPinnedAndProjectIndex()
+		if len(pinnedItems) > 0 || len(projectIndex) > 0 {
+			sb.WriteString("\n\n=== PERSISTENT CORE IDENTITY & ACTIVE PROJECTS ===\n")
+			for _, p := range pinnedItems {
+				sb.WriteString(fmt.Sprintf("- %s\n", p))
 			}
-			sb.WriteString("===================================")
+			if len(projectIndex) > 0 {
+				sb.WriteString("- Active Projects: " + strings.Join(projectIndex, ", ") + "\n")
+			}
+			sb.WriteString("Note: Deep context, episodic history, and technical details reside in RAG. Use memory(action='recall') for full context.\n")
+			sb.WriteString("==================================================")
 		}
 	}
 

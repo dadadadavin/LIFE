@@ -58,10 +58,21 @@ func TestToolsExecution(t *testing.T) {
 		t.Errorf("calculate_math wrong result: %v", res)
 	}
 
-	// 4. search_user_memory
+	// 4. memory (unified RAG tool)
+	res = executeLocalTool("memory", map[string]any{"action": "remember", "title": "Test Lifel Setup", "category": "project", "content": "Lifel runs on macOS with local semantic RAG."})
+	if res["status"] != "saved" && res["status"] != "queued" {
+		t.Errorf("memory remember failed: %v", res)
+	}
+
+	res = executeLocalTool("memory", map[string]any{"action": "recall", "query": "macOS"})
+	if res["count"] == nil && res["error"] != nil {
+		t.Errorf("memory recall failed: %v", res)
+	}
+
+	// Legacy redirect search_user_memory
 	res = executeLocalTool("search_user_memory", map[string]any{"query": "macOS"})
 	if res["count"] == nil {
-		t.Errorf("search_user_memory failed: %v", res)
+		t.Errorf("legacy search_user_memory failed: %v", res)
 	}
 
 	// 5. read_project_file

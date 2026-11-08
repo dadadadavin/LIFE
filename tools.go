@@ -2,8 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
-	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -104,40 +102,33 @@ var toolCatalog = []ToolSpec{
 		},
 	},
 	{
-		Name:        "save_user_memory",
-		Title:       "Save to Long-Term Memory",
-		Description: "Save a durable fact, user preference, project detail, or task to persistent memory (memory.json) across sessions.",
+		Name:        "memory",
+		Title:       "Unified Long-Term Memory & Local RAG",
+		Description: "Deep semantic search and stateful management of episodic, technical, and preference memories. Use 'recall' to retrieve past discussions and code context; use 'remember' to record new detailed knowledge; use 'update' to amend existing knowledge; use 'forget' to remove obsolete knowledge.",
 		Category:    "memory",
-		SampleArgs:  `{"content": "User is building Lifel in Go with HTMX and Tailwind CSS", "category": "project"}`,
+		SampleArgs:  `{"action": "recall", "query": "macOS audio setup and project architecture"}`,
 		Schema: &genai.Schema{
 			Type: genai.TypeObject,
 			Properties: map[string]*genai.Schema{
-				"content": {
+				"action": {
 					Type:        genai.TypeString,
-					Description: "The concise fact, preference, or reminder to save.",
+					Description: "Action to perform: 'recall' (semantic search), 'remember' (save new knowledge), 'update' (amend existing memory), or 'forget' (delete memory).",
+					Enum:        []string{"recall", "remember", "update", "forget"},
 				},
-				"category": {
-					Type:        genai.TypeString,
-					Description: "Category tag: 'user', 'preference', 'project', or 'task'.",
-				},
-			},
-			Required: []string{"content"},
-		},
-	},
-	{
-		Name:        "search_user_memory",
-		Title:       "Search Long-Term Memory",
-		Description: "Search or list saved facts and preferences from the user's persistent memory bank.",
-		Category:    "memory",
-		SampleArgs:  `{"query": ""}`,
-		Schema: &genai.Schema{
-			Type: genai.TypeObject,
-			Properties: map[string]*genai.Schema{
 				"query": {
 					Type:        genai.TypeString,
-					Description: "Optional keyword filter (leave empty to list all memories).",
+					Description: "Search query for semantic retrieval (used with 'recall').",
+				},
+				"content": {
+					Type:        genai.TypeString,
+					Description: "Rich multi-paragraph factual detail to store or update (used with 'remember' and 'update').",
+				},
+				"id": {
+					Type:        genai.TypeString,
+					Description: "Memory chunk UUID (optional, for 'update' or 'forget').",
 				},
 			},
+			Required: []string{"action"},
 		},
 	},
 	{
@@ -249,22 +240,6 @@ var toolCatalog = []ToolSpec{
 			Required: []string{"target"},
 		},
 	},
-	{
-		Name:        "capture_mac_screen",
-		Title:       "Capture High-Res Screen / HD Frame",
-		Description: "Capture a high-resolution snapshot of the user's Mac screen or request a crisp 1280p HD frame from the active camera/screen stream to inspect fine text, code, or hardware.",
-		Category:    "vision",
-		SampleArgs:  `{"source": "auto"}`,
-		Schema: &genai.Schema{
-			Type: genai.TypeObject,
-			Properties: map[string]*genai.Schema{
-				"source": {
-					Type:        genai.TypeString,
-					Description: "'auto' (camera/screen stream + Mac display), 'browser' (HD camera/screen frame), or 'mac_display' (macOS screencapture).",
-				},
-			},
-		},
-	},
 }
 
 func buildGenAITools(cfg AppConfig) []*genai.Tool {
@@ -312,17 +287,13 @@ func cleanHTMLText(raw string) string {
 
 // truncateToolOutput recursively guards string values in tool execution outputs,
 // capping strings to maxChars (default 8,000 chars ~ 2,000 tokens) to prevent context blowout
-// in Gemini Live while preserving internal binary payloads (_native_screen_b64).
+// in Gemini Live.
 func truncateToolOutput(m map[string]any, maxChars int) map[string]any {
 	if m == nil {
 		return nil
 	}
 	out := make(map[string]any, len(m))
 	for k, v := range m {
-		if k == "_native_screen_b64" {
-			out[k] = v
-			continue
-		}
 		out[k] = truncateToolValue(v, maxChars)
 	}
 	return out
@@ -406,6 +377,130 @@ func runLocalTool(name string, args map[string]any) map[string]any {
 			"workspace_dir": baseDir,
 		}
 
+	case "memory":
+		action := strings.ToLower(strArg("action"))
+		if action == "" {
+			action = "recall"
+		}
+		query := strArg("query")
+		content := strArg("content")
+		id := strArg("id")
+		isAsync, _ := args["_async"].(bool)
+		prefKey := strArg("_preferred_key")
+
+		switch action {
+		case "recall":
+			scored, err := SearchRAGMemory(query, 3, prefKey)
+			if err != nil {
+				return map[string]any{"action": "recall", "query": query, "error": err.Error()}
+			}
+			if len(scored) == 0 {
+				return map[string]any{
+					"action":  "recall",
+					"query":   query,
+					"count":   0,
+					"message": "No relevant memories found in local RAG store.",
+				}
+			}
+			var md strings.Builder
+			md.WriteString(fmt.Sprintf("### Recalled Memories for %q:\n", query))
+			var results []map[string]any
+			for _, s := range scored {
+				c := s.Chunk
+				md.WriteString(fmt.Sprintf("\n#### [%s] %s (Score: %.2f | Similarity: %.2f | Recency: %.2f)\n%s\n",
+					strings.ToUpper(c.Category), c.Title, s.HybridScore, s.CosineSimilarity, s.RecencyScore, c.Content))
+				results = append(results, map[string]any{
+					"id":         c.ID,
+					"title":      c.Title,
+					"category":   c.Category,
+					"content":    c.Content,
+					"score":      s.HybridScore,
+					"similarity": s.CosineSimilarity,
+					"recency":    s.RecencyScore,
+					"updated_at": c.UpdatedAt.Format(time.RFC3339),
+				})
+			}
+			return map[string]any{
+				"action":   "recall",
+				"query":    query,
+				"count":    len(scored),
+				"markdown": md.String(),
+				"results":  results,
+			}
+
+		case "remember":
+			if content == "" {
+				return map[string]any{"error": "content is required for remember action"}
+			}
+			category := strArg("category")
+			if category == "" {
+				category = "episodic"
+			}
+			title := strArg("title")
+			if title == "" {
+				title = "Voice Memory"
+			}
+			if isAsync {
+				go func() {
+					_, _ = InsertRAGChunk(title, category, content, prefKey)
+				}()
+				return map[string]any{
+					"status":  "queued",
+					"action":  "remember",
+					"message": "Memory operation initiated asynchronously in background.",
+				}
+			}
+			ch, err := InsertRAGChunk(title, category, content, prefKey)
+			if err != nil {
+				return map[string]any{"action": "remember", "error": err.Error()}
+			}
+			return map[string]any{"status": "saved", "action": "remember", "id": ch.ID, "title": ch.Title}
+
+		case "update":
+			if id == "" {
+				return map[string]any{"error": "id is required for update action"}
+			}
+			if isAsync {
+				go func() {
+					_ = UpdateRAGChunk(id, strArg("title"), strArg("category"), content, prefKey)
+				}()
+				return map[string]any{
+					"status":  "queued",
+					"action":  "update",
+					"message": "Memory update initiated asynchronously in background.",
+				}
+			}
+			err := UpdateRAGChunk(id, strArg("title"), strArg("category"), content, prefKey)
+			if err != nil {
+				return map[string]any{"action": "update", "error": err.Error()}
+			}
+			return map[string]any{"status": "updated", "action": "update", "id": id}
+
+		case "forget":
+			if id == "" {
+				return map[string]any{"error": "id is required for forget action"}
+			}
+			if isAsync {
+				go func() {
+					_ = DeleteRAGChunk(id)
+				}()
+				return map[string]any{
+					"status":  "queued",
+					"action":  "forget",
+					"message": "Memory deletion initiated asynchronously in background.",
+				}
+			}
+			err := DeleteRAGChunk(id)
+			if err != nil {
+				return map[string]any{"action": "forget", "error": err.Error()}
+			}
+			return map[string]any{"status": "deleted", "action": "forget", "id": id}
+
+		default:
+			return map[string]any{"error": fmt.Sprintf("unsupported memory action %q", action)}
+		}
+
+	// Legacy backward compatibility redirects
 	case "save_user_memory":
 		content := strArg("content")
 		category := strArg("category")
@@ -416,21 +511,17 @@ func runLocalTool(name string, args map[string]any) map[string]any {
 			return map[string]any{"error": "content is required"}
 		}
 		item := addMemoryItem(content, category, "voice_tool", false)
+		_, _ = InsertRAGChunk("User Memory", category, content, "")
 		return map[string]any{"status": "saved", "memory": item}
 
 	case "search_user_memory":
-		q := strings.ToLower(strArg("query"))
-		all := loadMemories()
-		var matched []MemoryItem
-		for _, m := range all {
-			if q == "" || strings.Contains(strings.ToLower(m.Content), q) || strings.Contains(strings.ToLower(m.Category), q) {
-				matched = append(matched, m)
-			}
+		q := strArg("query")
+		scored, _ := SearchRAGMemory(q, 10, "")
+		var results []any
+		for _, s := range scored {
+			results = append(results, s.Chunk)
 		}
-		if len(matched) > 25 {
-			matched = matched[:25]
-		}
-		return map[string]any{"count": len(matched), "memories": matched}
+		return map[string]any{"count": len(results), "memories": results}
 
 	case "web_search":
 		query := strArg("query")
@@ -633,34 +724,6 @@ func runLocalTool(name string, args map[string]any) map[string]any {
 			return map[string]any{"status": "opened_application", "app": target}
 		}
 		return map[string]any{"error": "target not found in workspace and is not a valid application name"}
-
-	case "capture_mac_screen":
-		source := strArg("source")
-		if source == "" {
-			source = "auto"
-		}
-		out := map[string]any{
-			"status":                    "frame_requested",
-			"source":                    source,
-			"_request_browser_hd_frame": true,
-			"message":                   "Requested 1280p HD frame from active browser stream.",
-		}
-		// Also attempt native macOS screencapture if source is "screen" or "auto"
-		if source == "screen" || source == "auto" {
-			tmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("lifel_screen_%d.jpg", time.Now().UnixNano()))
-			defer os.Remove(tmpFile)
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer cancel()
-			if err := exec.CommandContext(ctx, "screencapture", "-x", "-t", "jpg", tmpFile).Run(); err == nil {
-				_ = exec.CommandContext(ctx, "sips", "-Z", "1280", tmpFile).Run()
-				if rawBytes, err := os.ReadFile(tmpFile); err == nil && len(rawBytes) > 0 {
-					out["_native_screen_b64"] = base64.StdEncoding.EncodeToString(rawBytes)
-					out["native_capture"] = true
-					out["message"] = "Captured native 1280p macOS screen JPEG and requested active browser HD frame."
-				}
-			}
-		}
-		return out
 	}
 
 	return map[string]any{"error": fmt.Sprintf("unknown tool %q", name)}

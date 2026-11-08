@@ -642,7 +642,6 @@ func registerRoutes(mux *http.ServeMux) {
 			}
 		}
 		res := executeLocalTool(name, argsMap)
-		delete(res, "_native_screen_b64")
 		pretty, _ := json.MarshalIndent(res, "", "  ")
 		writeHTML(w, fmt.Sprintf(`<pre class="p-3 rounded bg-white border border-[#e4e4df] text-[#1a1a19] text-[12px] font-mono overflow-x-auto max-h-[320px]">%s</pre>`, html.EscapeString(string(pretty))))
 	})
@@ -867,7 +866,6 @@ func registerRoutes(mux *http.ServeMux) {
 			return
 		}
 		res := executeLocalTool(body.Name, body.Args)
-		delete(res, "_native_screen_b64")
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "result": res})
 	})
 
