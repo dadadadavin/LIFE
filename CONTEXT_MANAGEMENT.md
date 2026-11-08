@@ -139,7 +139,7 @@ You are Lifel, an advanced Jarvis-like personal AI operating assistant running n
 Lifel enforces strict **System Prompt Hygiene**:
 1. **No Internal Secret Leaks**: Active key slot aliases (such as `GEMINI_API_KEY_5`), API tokens, or environment variable identifiers are **never** injected into the LLM system prompt.
 2. **No Implementation Clutter**: Go compiler versions (`go1.24.0 darwin/arm64`) and web stack names (`HTMX`, `Tailwind CSS`) are excluded from general voice sessions. Feeding infrastructure secrets into every call wastes baseline tokens and causes "meta-slop" where the voice assistant unnecessarily mentions its tech stack.
-3. **Protected Sliding-Window Isolation**: Historical session turns are **never** injected into Layer 5 of `SystemInstruction`. Because `SystemInstruction` is permanently protected from server-side eviction, putting 20 turns of past dialogue in the system prompt makes stale history immortal and causes hallucinations (e.g., repeating hours-old battery levels without calling the tool). Historical context belongs in the mutable KV-cache via `SendClientContent` (see Section 9).
+3. **Protected Sliding-Window Isolation**: Historical session turns are **never** injected into Layer 5 of `SystemInstruction`. Because `SystemInstruction` is permanently protected from server-side eviction, putting 20 turns of past dialogue in the system prompt makes stale history immortal and causes hallucinations (e.g., repeating hours-old battery levels without calling the tool). Historical context belongs in the mutable KV-cache via `SendClientContent` (see Section 10).
 
 ---
 
@@ -196,7 +196,7 @@ In `tools.go`, Lifel applies a recursive payload guardrail via `truncateToolOutp
 
 ---
 
-## 7. Barge-In, Interruption & Tool Cancellation
+## 7. Barge-In, Interruption & Tool Scheduling
 
 ### Voice Activity Detection (VAD) & Transcript Synchronization
 When the user speaks while Gemini is speaking or executing a tool:
@@ -218,7 +218,47 @@ Gemini Live provides three scheduling modes for returning tool outputs:
 
 ---
 
-## 8. Server-Side Sliding Window Compaction
+## 8. Real-Time Concurrency, Ordering & Execution Invariants (The 7 Runtime Guarantees)
+
+Production full-duplex conversational systems must handle subtle race conditions that arise when audio chunks, vision frames, tool executions, and WebSocket stream updates intersect concurrently. In `live_ws.go`, Lifel enforces seven strict runtime guarantees:
+
+### 8.1 Chronological Turn Ordering (`flushPendingUserTurn`)
+* **The Problem**: When a user speaks a command that triggers a tool (e.g. *"What is my battery level?"*), Gemini sends `sc.InputTranscription` chunks and then immediately sends `resp.ToolCall` before emitting any spoken output (`sc.OutputTranscription == nil`) and before turn completion. If user text is only flushed on model speech, the transcript would record `[TOOL CALL] -> [USER] -> [MODEL]`.
+* **The Invariant**: Lifel defines `flushPendingUserTurn()`, invoked immediately at the entry of `resp.ToolCall`, `sc.OutputTranscription`, and `sc.ModelTurn`. This guarantees that user speech is committed to `turnsLog` **prior to tool invocation**: `[USER] -> [TOOL CALL] -> [TOOL RESULT] -> [MODEL]`.
+
+### 8.2 Non-Blocking Asynchronous Tool Dispatching
+* **The Problem**: Executing `executeLocalTool` synchronously on the `session.Receive()` loop freezes the receive loop for 2–5 seconds during slow web searches or page crawling. During this window, `session.Receive()` cannot process incoming `resp.ToolCallCancellation` or `sc.Interrupted` frames.
+* **The Invariant**: All `resp.ToolCall` instances are dispatched in background worker goroutines (`go func(tc *genai.LiveServerToolCall)`). The receive loop continues polling without delay. A thread-safe `cancelledTools map[string]bool` tracks server cancellations, and tool responses are suppressed both before and after execution if a cancellation frame arrived.
+
+### 8.3 Thread-Safe Session Mutation Wrappers (`sessionWriteMu`)
+* **The Problem**: Under the hood, `google.golang.org/genai` writes directly to a Gorilla WebSocket connection (`conn.WriteJSON`). Goroutine 1 (mic audio, video frames, text input) and Goroutine 2 / Tool Workers (native screen injections, tool responses) can write simultaneously, triggering a fatal Go panic: `concurrent write to websocket connection`.
+* **The Invariant**: Lifel protects all session writes behind `sessionWriteMu sync.Mutex` using dedicated helpers:
+  - `sendRealtimeSafe(in genai.LiveRealtimeInput)`
+  - `sendClientContentSafe(in genai.LiveClientContentInput)`
+  - `sendToolResponseSafe(in genai.LiveToolResponseInput)`
+
+### 8.4 Model & Tool Sandbox Isolation
+* **The Problem**: Robotics spatial intelligence models (`gemini-robotics-er-2-streaming-preview`) operate on pure text output and spatial bounding boxes; attaching desktop macOS tools breaks their reasoning mode.
+* **The Invariant**: `liveCfg.Tools` is strictly populated inside `if !isRobotics`. Desktop tool schemas are never leaked into physical robotics sessions.
+
+### 8.5 Alternating Turn Role Coalescing in Cold Resumption
+* **The Problem**: When reading historical sessions from `sessions/<id>.json`, pruning `tool` turns can leave consecutive `user` turns (e.g., user sent text then spoke audio) or consecutive `model` turns. Sending non-alternating turns into `session.SendClientContent` can cause server validation rejections.
+* **The Invariant**: Lifel inspects `histContent` as it is assembled: if `histContent[len-1].Role == role`, adjacent turn texts are merged (`strings.TrimSpace(lastPart.Text + "\n" + t.Text)`), guaranteeing strictly alternating `user` $\to$ `model` $\to$ `user` structure.
+
+### 8.6 GoAway Socket Rotation vs. Final Disconnect Differentiation
+* **The Problem**: When a call reaches the $\sim 10$-minute socket lifetime limit, Google sends `resp.GoAway` and closes the WebSocket so the client can perform an automated warm reconnect. If the disconnect handler treated this as an end-of-call event, the background Flash memory distillation worker would fire mid-conversation every 10 minutes.
+* **The Invariant**: Lifel tracks `sawGoAway bool`. If `sawGoAway` is true (or client sends `warm_rotate`), memory distillation is suppressed so that consolidation only runs upon genuine user disconnection.
+
+### 8.7 Pinned Fact Anti-Duplication Prompt Architecture
+* **The Problem**: Passing pinned memories alongside dynamic memories under a unified "Stored Facts" header caused the Flash distillation model to rephrase pinned facts, which failed exact character matching during merges and generated duplicate entries in `memory.json`.
+* **The Invariant**: The distillation prompt strictly isolates:
+  - `1. Pinned Core Facts (Read-Only Context — DO NOT repeat or echo)`
+  - `2. Current Dynamic Facts (Consolidate, update, or prune)`
+  Fuzzy substring containment checks prevent rephrased pinned facts from entering the dynamic pool, and a hard cap of 25 items guarantees that baseline prompts never inflate.
+
+---
+
+## 9. Server-Side Sliding Window Compaction
 
 During long voice calls or continuous camera streaming, context can approach $100,000+$ tokens.
 
@@ -247,7 +287,7 @@ In `live_ws.go`, Lifel configures Google's server-side **Context Window Compress
 
 ---
 
-## 9. Two-Tier Resumption Architecture
+## 10. Two-Tier Resumption Architecture
 
 Past context survives interruptions, disconnects, and restarts through a two-tier strategy:
 
@@ -328,7 +368,7 @@ If the session ended more than 2 hours ago, or the user selects a past session f
 
 ---
 
-## 10. Autonomous Memory Distillation Loop (`memory.json`)
+## 11. Autonomous Memory Distillation Loop (`memory.json`)
 
 Transcripts in `sessions/*.json` are raw and verbose. To maintain durable facts across all future sessions without blowing up prompt tokens, Lifel uses a **Background Distillation Worker**.
 
@@ -371,7 +411,7 @@ Rather than blindly appending strings, Lifel sends **existing stored memories** 
 
 ---
 
-## 11. Observability, Metrics & Telemetry
+## 12. Observability, Metrics & Telemetry
 
 Context consumption and live health can be verified in real time across three surfaces:
 
@@ -393,7 +433,7 @@ Context consumption and live health can be verified in real time across three su
 
 ---
 
-## 12. Context Architecture Comparison Matrix
+## 13. Context Architecture Comparison Matrix
 
 | Capability | Standard Chat REST APIs | Lifel Gemini Live Implementation |
 | :--- | :--- | :--- |
@@ -403,6 +443,9 @@ Context consumption and live health can be verified in real time across three su
 | **Warm Resumption** | Not supported (full history re-sent) | Instant resume via 2-hour handle at **0 extra tokens** |
 | **Cold Resumption** | Injected into System Instruction | Seeded via `SendClientContent` into mutable cache |
 | **Connection Lifetime Rotation** | Manual reconnect loops | Handled via `GoAway` signal with `TimeLeft` |
+| **Concurrency Safety** | Not applicable (stateless HTTP requests) | Thread-safe writes via `sessionWriteMu` mutex wrapper |
+| **Turn Ordering Invariant** | Non-streaming (client defines order) | `flushPendingUserTurn` guarantees `[USER] -> [TOOL] -> [MODEL]` |
+| **Tool Execution Model** | Synchronous wait | Non-blocking async dispatch with pre/post cancellation check |
 | **Tool Scheduling** | Model halts until tool returns | Configurable `WHEN_IDLE`, `INTERRUPT`, and `SILENT` |
 | **Tool Payload Safety** | Unchecked (vulnerable to prompt blowout) | 8,000-char truncation guardrail on every tool output |
 | **Long-Term Memory** | Static system prompt or raw RAG | Conflict-resolving Flash consolidation capped at 25 items |
