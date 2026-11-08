@@ -172,7 +172,7 @@ func defaultConfig() AppConfig {
 			"open_url_or_app",
 			"capture_mac_screen",
 		},
-		SystemInstruction: "You are Lifel, a fast, intelligent, and natural real-time voice and vision assistant running natively in Go on the user's Mac. Always respond in the same language the user speaks (English or Indonesian). Keep your spoken answers natural, direct, and easy to listen to. When the user shares their webcam or screen, inspect text, objects, code, or hardware accurately. Use your available tools proactively whenever asked to search the web, read articles, check Mac status, use the clipboard, capture the screen, or save memories.",
+		SystemInstruction: "You are Lifel, an advanced Jarvis-like personal AI operating assistant running natively on the user's Mac. Always respond in the same language the user speaks (English or Indonesian). Keep your spoken answers crisp, natural, direct, and intelligent with zero conversational fluff. When asked to perform actions, check Mac status, search the live web, inspect files, capture the screen, or save notes and memories, execute the appropriate tools proactively and smoothly.",
 	}
 }
 
@@ -445,13 +445,15 @@ func buildRoboticsSystemPrompt(customTask string) string {
 	return sb.String()
 }
 
-// BuildFullSystemPrompt injects Runtime Self-Awareness (Update #3), Response Style (Update #8),
-// Persistent Memory Bank (Update #10), and Resumed Session Context (Update #5).
+// BuildFullSystemPrompt injects Runtime Self-Awareness (clean Jarvis operational context),
+// Response Style directive, and Persistent Memory Bank. Historical resumed turns are intentionally
+// omitted here; they are seeded directly into the mutable KV-cache via SendClientContent in live_ws.go
+// so they do not permanently bloat or freeze within SystemInstruction.
 func buildFullSystemPrompt(cfg AppConfig, activeKeyName string) string {
 	var sb strings.Builder
 	sb.WriteString(strings.TrimSpace(cfg.SystemInstruction))
 
-	// Response style directive (Update #8)
+	// Response style directive
 	switch cfg.ResponseStyle {
 	case "concise":
 		sb.WriteString("\n\n[RESPONSE STYLE: CONCISE] Keep spoken answers brief (1 to 2 sentences by default) unless the user asks for a deep explanation.")
@@ -461,24 +463,21 @@ func buildFullSystemPrompt(cfg AppConfig, activeKeyName string) string {
 		sb.WriteString("\n\n[RESPONSE STYLE: BALANCED] Keep spoken answers natural, clear, and moderately paced.")
 	}
 
-	// Runtime Self-Awareness Block (Update #3)
-	sb.WriteString("\n\n=== RUNTIME SELF-AWARENESS & SYSTEM METADATA ===\n")
-	sb.WriteString(fmt.Sprintf("- Assistant Name: Lifel\n"))
-	sb.WriteString(fmt.Sprintf("- Exact Base AI Model: %s (Google Gemini 3.8 Live multimodal bidirectional model)\n", cfg.Model))
-	sb.WriteString(fmt.Sprintf("- Active Voice Profile: %s\n", cfg.VoiceName))
-	sb.WriteString(fmt.Sprintf("- Active API Key Slot: %s\n", activeKeyName))
-	sb.WriteString(fmt.Sprintf("- Backend Engine: Go (%s %s/%s) + google.golang.org/genai SDK + HTMX + Tailwind CSS\n", runtime.Version(), runtime.GOOS, runtime.GOARCH))
+	// Runtime Operating Context (Clean Jarvis self-awareness without infrastructure leaks)
+	sb.WriteString("\n\n=== RUNTIME OPERATING CONTEXT ===\n")
+	sb.WriteString("- Assistant Name: Lifel (Omnipresent Personal Operating Assistant)\n")
+	sb.WriteString(fmt.Sprintf("- Platform & Hardware: macOS Apple Silicon (%s/%s)\n", runtime.GOOS, runtime.GOARCH))
 	sb.WriteString(fmt.Sprintf("- Local Date & Time: %s\n", time.Now().Format("2006-01-02 15:04:05 (Monday)")))
-	sb.WriteString(fmt.Sprintf("- Active Speech Languages (Bilingual STT): %s (Transcription Mode: %s)\n", cfg.SttLanguages, cfg.TranscriptionMode))
+	sb.WriteString("- Primary Location & Timezone: Asia/Jakarta (WIB) / User Local Time\n")
+	sb.WriteString(fmt.Sprintf("- Active Voice Profile: %s\n", cfg.VoiceName))
 	if strings.TrimSpace(cfg.CustomVocabulary) != "" {
-		sb.WriteString(fmt.Sprintf("- Custom Vocabulary & Domain Terms (recognize these spellings accurately when spoken): %s\n", cfg.CustomVocabulary))
+		sb.WriteString(fmt.Sprintf("- Custom Vocabulary & Domain Terms: %s\n", cfg.CustomVocabulary))
 	}
-	sb.WriteString(fmt.Sprintf("- Web Search & Intelligence Engine: %s (Depth: %s)\n", cfg.WebSearchProvider, cfg.TavilySearchDepth))
-	sb.WriteString(fmt.Sprintf("- Enabled Local Tools (%d): %s\n", len(cfg.EnabledTools), strings.Join(cfg.EnabledTools, ", ")))
-	sb.WriteString("- Note: If the user asks what model you are, what voice you use, or how you are built, state these exact facts directly.\n")
-	sb.WriteString("================================================")
+	sb.WriteString(fmt.Sprintf("- Enabled Native Tools (%d): %s\n", len(cfg.EnabledTools), strings.Join(cfg.EnabledTools, ", ")))
+	sb.WriteString("- Operating Directive: Act like Jarvis—proactive, razor-sharp, helpful, and concise. Never leak internal API keys, slot names, or low-level web framework details.\n")
+	sb.WriteString("================================")
 
-	// Persistent User Memory Bank (Update #10)
+	// Persistent User Memory Bank
 	if cfg.InjectMemory {
 		memories := loadMemories()
 		if len(memories) > 0 {
@@ -491,29 +490,6 @@ func buildFullSystemPrompt(cfg AppConfig, activeKeyName string) string {
 				sb.WriteString(fmt.Sprintf("- %s[%s] %s\n", pinTag, strings.ToUpper(m.Category), m.Content))
 			}
 			sb.WriteString("===================================")
-		}
-	}
-
-	// Resumed Session Context (Dual-Layer Context Fallback)
-	targetSessionID := cfg.ResumeSessionID
-	if targetSessionID == "" && cfg.ContinueLastSession {
-		summaries := listSessionSummaries()
-		if len(summaries) > 0 {
-			targetSessionID = summaries[0].ID
-		}
-	}
-	if targetSessionID != "" {
-		if rec, err := getSessionRecord(targetSessionID); err == nil && len(rec.Turns) > 0 {
-			sb.WriteString(fmt.Sprintf("\n\n=== RESUMED CONVERSATION CONTEXT (Session %s from %s) ===\n", rec.ID, rec.StartedAt))
-			sb.WriteString("The user is continuing this previous conversation. Pick up naturally where you left off:\n")
-			startIdx := 0
-			if len(rec.Turns) > 20 {
-				startIdx = len(rec.Turns) - 20
-			}
-			for _, t := range rec.Turns[startIdx:] {
-				sb.WriteString(fmt.Sprintf("[%s] %s: %s\n", t.Time, strings.ToUpper(t.Role), t.Text))
-			}
-			sb.WriteString("=========================================================")
 		}
 	}
 

@@ -182,6 +182,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 	var session *genai.Session
 	var connectedKeyName string
 	var lastConnErr error
+	var didWarmResume bool
 
 	for _, k := range orderedKeys {
 		fmt.Printf("%s \033[34m[GEMINI]\033[0m Handshaking with %s using key slot %s...\n",
@@ -206,10 +207,12 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 
 		liveCfg := buildLiveConnectConfig(cfg, k.Name)
+		hasWarmHandle := (liveCfg.SessionResumption != nil && liveCfg.SessionResumption.Handle != "")
 		sess, err := client.Live.Connect(ctx, cfg.Model, liveCfg)
-		if err != nil && liveCfg.SessionResumption != nil {
-			fmt.Printf("%s \033[33m[GEMINI RESUMPTION]\033[0m Session resumption failed (%v), retrying without resumption config...\n", time.Now().Format("15:04:05"), err)
-			liveCfg.SessionResumption = nil
+		if err != nil && hasWarmHandle {
+			fmt.Printf("%s \033[33m[GEMINI RESUMPTION]\033[0m Warm session resumption failed (%v), falling back to fresh session...\n", time.Now().Format("15:04:05"), err)
+			hasWarmHandle = false
+			liveCfg.SessionResumption = &genai.SessionResumptionConfig{}
 			sess, err = client.Live.Connect(ctx, cfg.Model, liveCfg)
 		}
 		if err != nil {
@@ -224,6 +227,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 
 		session = sess
 		connectedKeyName = k.Name
+		didWarmResume = hasWarmHandle
 		break
 	}
 
@@ -241,8 +245,50 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	defer session.Close()
 
-	fmt.Printf("%s \033[1;32m[GEMINI SUCCESS]\033[0m Live session ready! Model: %s | Voice: %s | Key: %s\n",
-		time.Now().Format("15:04:05"), cfg.Model, cfg.VoiceName, connectedKeyName)
+	fmt.Printf("%s \033[1;32m[GEMINI SUCCESS]\033[0m Live session ready! Model: %s | Voice: %s | Key: %s (WarmResumed: %v)\n",
+		time.Now().Format("15:04:05"), cfg.Model, cfg.VoiceName, connectedKeyName, didWarmResume)
+
+	// Cold Resumption (Tier B): If not warm-resumed from Google server KV-cache, seed previous turns into mutable context
+	targetColdSessionID := cfg.ResumeSessionID
+	if targetColdSessionID == "" && cfg.ContinueLastSession && !didWarmResume {
+		summaries := listSessionSummaries()
+		if len(summaries) > 0 {
+			targetColdSessionID = summaries[0].ID
+		}
+	}
+	if !didWarmResume && targetColdSessionID != "" {
+		if rec, err := getSessionRecord(targetColdSessionID); err == nil && len(rec.Turns) > 0 {
+			var histContent []*genai.Content
+			startIdx := 0
+			if len(rec.Turns) > 20 {
+				startIdx = len(rec.Turns) - 20
+			}
+			for _, t := range rec.Turns[startIdx:] {
+				if t.Role == "tool" {
+					continue
+				}
+				role := "user"
+				if t.Role == "model" {
+					role = "model"
+				}
+				histContent = append(histContent, &genai.Content{
+					Role:  role,
+					Parts: []*genai.Part{{Text: t.Text}},
+				})
+			}
+			if len(histContent) > 0 {
+				turnComplete := false
+				fmt.Printf("%s \033[35m[COLD RESUMPTION]\033[0m Seeding %d historical turns into mutable context via SendClientContent (Session: %s)...\n",
+					time.Now().Format("15:04:05"), len(histContent), targetColdSessionID)
+				if err := session.SendClientContent(genai.LiveClientContentInput{
+					Turns:        histContent,
+					TurnComplete: &turnComplete,
+				}); err != nil {
+					fmt.Printf("%s \033[33m[COLD RESUMPTION WARNING]\033[0m Failed to seed turns: %v\n", time.Now().Format("15:04:05"), err)
+				}
+			}
+		}
+	}
 
 	// Clear one-time resume_session_id once connected
 	if cfg.ResumeSessionID != "" {
@@ -421,19 +467,49 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			// Update #5: Persist Session Resumption Handle to config.json asynchronously
-			if resp.SessionResumptionUpdate != nil && resp.SessionResumptionUpdate.NewHandle != "" {
-				newHandle := resp.SessionResumptionUpdate.NewHandle
-				logMu.Lock()
-				latestResumptionHandle = newHandle
-				logMu.Unlock()
-				fmt.Printf("%s \033[35m[RESUMPTION]\033[0m Handle saved: %s\n", time.Now().Format("15:04:05"), newHandle)
-				go func(h string) {
-					_ = saveConfigMap(map[string]any{"last_resumption_handle": h})
-				}(newHandle)
+			// Session Resumption Update (Check Resumable flag to avoid overwriting valid UUID during non-resumable states)
+			if resp.SessionResumptionUpdate != nil {
+				if resp.SessionResumptionUpdate.Resumable && resp.SessionResumptionUpdate.NewHandle != "" {
+					newHandle := resp.SessionResumptionUpdate.NewHandle
+					logMu.Lock()
+					latestResumptionHandle = newHandle
+					logMu.Unlock()
+					fmt.Printf("%s \033[35m[RESUMPTION]\033[0m Handle saved (resumable=true): %s\n", time.Now().Format("15:04:05"), newHandle)
+					go func(h string) {
+						_ = saveConfigMap(map[string]any{"last_resumption_handle": h})
+					}(newHandle)
+					_ = safeSend(map[string]any{
+						"type":      "resumption_update",
+						"handle":    newHandle,
+						"resumable": true,
+					})
+				} else if !resp.SessionResumptionUpdate.Resumable {
+					fmt.Printf("%s \033[35m[RESUMPTION]\033[0m Session temporarily non-resumable (in-flight generation/tool)\n", time.Now().Format("15:04:05"))
+					_ = safeSend(map[string]any{
+						"type":      "resumption_update",
+						"resumable": false,
+					})
+				}
+			}
+
+			// Handle Server GoAway (Connection Lifetime Rotation ~10 minutes)
+			if resp.GoAway != nil {
+				timeLeft := resp.GoAway.TimeLeft
+				fmt.Printf("%s \033[1;33m[GEMINI GOAWAY]\033[0m Server requested disconnect. Time left: %v\n", time.Now().Format("15:04:05"), timeLeft)
 				_ = safeSend(map[string]any{
-					"type":   "resumption_update",
-					"handle": newHandle,
+					"type":         "go_away",
+					"time_left":    timeLeft.String(),
+					"time_left_ms": timeLeft.Milliseconds(),
+				})
+			}
+
+			// Handle Tool Call Cancellation on User Barge-in / Interruption
+			if resp.ToolCallCancellation != nil && len(resp.ToolCallCancellation.IDs) > 0 {
+				cancelledIDs := resp.ToolCallCancellation.IDs
+				fmt.Printf("%s \033[33m[TOOL CANCELLED]\033[0m Server cancelled tool calls due to user interruption: %v\n", time.Now().Format("15:04:05"), cancelledIDs)
+				_ = safeSend(map[string]any{
+					"type":          "tool_call_cancellation",
+					"cancelled_ids": cancelledIDs,
 				})
 			}
 
@@ -728,6 +804,10 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 					if sched == "" {
 						sched = genai.FunctionResponseSchedulingWhenIdle
 					}
+					// Background memory persistence should be absorbed silently without vocally interrupting
+					if fc.Name == "save_user_memory" {
+						sched = genai.FunctionResponseSchedulingSilent
+					}
 					fnResponses = append(fnResponses, &genai.FunctionResponse{
 						ID:         fc.ID,
 						Name:       fc.Name,
@@ -800,7 +880,8 @@ var MemoryRoutingModels = []string{
 }
 
 // extractMemoriesAndSummary runs after a session ends with intelligent model routing,
-// exponential backoff retry, and multi-key failover to ensure memories are never dropped.
+// exponential backoff retry, multi-key failover, and memory bank consolidation to ensure
+// durable facts are resolved, deduplicated, capped at 25 items, and never dropped.
 func extractMemoriesAndSummary(sessionID string, turns []TurnEntry, preferredKey string) {
 	var lines []string
 	for _, t := range turns {
@@ -818,13 +899,49 @@ func extractMemoriesAndSummary(sessionID string, turns []TurnEntry, preferredKey
 	}
 	convoText := strings.Join(lines, "\n")
 
-	prompt := fmt.Sprintf(`Analyze this voice conversation transcript between the User and Gemini.
-Return a JSON object with two fields:
-1. "summary": A concise 1-2 sentence summary of what was discussed or accomplished in this session.
-2. "facts": A JSON array of new, durable personal facts, preferences, or project details about the User worth remembering long-term (each with "fact" and "category" in ["preference", "project", "user", "task"]). If no new durable facts were shared, return [].
+	// Read existing durable memory facts to allow contradiction resolution and deduplication
+	existingMemories := loadMemories()
+	var existingFacts []string
+	for _, m := range existingMemories {
+		if m.Category == "summary" {
+			continue
+		}
+		pinnedTag := ""
+		if m.Pinned {
+			pinnedTag = "[PINNED] "
+		}
+		existingFacts = append(existingFacts, fmt.Sprintf("- %s[%s] %s", pinnedTag, m.Category, m.Content))
+	}
+	factsContext := "None recorded yet."
+	if len(existingFacts) > 0 {
+		factsContext = strings.Join(existingFacts, "\n")
+	}
 
-Transcript:
-%s`, convoText)
+	prompt := fmt.Sprintf(`You are the Memory Consolidation Engine for Lifel, an advanced Jarvis-like personal AI operating assistant.
+Review the user's currently stored memory bank and the transcript from their latest conversation.
+
+1. Current Stored Facts:
+%s
+
+2. Latest Voice Conversation Transcript:
+%s
+
+Your task is to return a JSON object with:
+1. "summary": A crisp 1-2 sentence rolling summary of what was accomplished or discussed in this session.
+2. "facts": A consolidated, deduplicated, contradiction-resolved list of at most 20 durable facts about the User (preferences, project context, hardware, habits).
+   - Retain existing valid facts unless contradicted or superseded by new information in the transcript.
+   - If an old fact is contradicted or changed (e.g. new location, new tool, updated preference), replace it with the updated fact.
+   - Extract new high-signal personal/project facts from the transcript.
+   - Categorize each as "preference", "project", "user", or "task".
+   - Discard trivial, fleeting chatter or temporary statuses.
+
+Return strictly valid JSON:
+{
+  "summary": "Concise 1-2 sentence rolling summary...",
+  "facts": [
+    {"fact": "...", "category": "preference|project|user|task"}
+  ]
+}`, factsContext, convoText)
 
 	keys := getOrderedAPIKeys(preferredKey, true)
 	if len(keys) == 0 {
@@ -946,6 +1063,7 @@ KeyLoop:
 		return
 	}
 
+	// 1. Update rolling session summary
 	if strings.TrimSpace(parsed.Summary) != "" {
 		addMemoryItem(
 			fmt.Sprintf("Last session (%s): %s", sessionID, strings.TrimSpace(parsed.Summary)),
@@ -956,15 +1074,54 @@ KeyLoop:
 		fmt.Printf("%s \033[35m[MEMORY]\033[0m [%s via %s] Updated rolling session summary: \"%s\"\n",
 			time.Now().Format("15:04:05"), successfulModel, successfulKey, strings.TrimSpace(parsed.Summary))
 	}
-	for _, f := range parsed.Facts {
-		if strings.TrimSpace(f.Fact) != "" {
-			cat := f.Category
-			if cat == "" {
-				cat = "fact"
-			}
-			addMemoryItem(f.Fact, cat, fmt.Sprintf("auto:%s", sessionID), false)
-			fmt.Printf("%s \033[35m[MEMORY]\033[0m Stored new durable fact [%s]: %s\n",
-				time.Now().Format("15:04:05"), cat, f.Fact)
+
+	// 2. Memory Bank Consolidation & Contradiction Resolution:
+	// Pinned items are protected system or explicitly user-pinned memories and are never removed.
+	// Dynamic items are updated with the model's consolidated output, capped at 25 total entries.
+	current := loadMemories()
+	var pinnedItems []MemoryItem
+	for _, m := range current {
+		if m.Pinned {
+			pinnedItems = append(pinnedItems, m)
 		}
 	}
+
+	var newItems []MemoryItem
+	for _, f := range parsed.Facts {
+		factText := strings.TrimSpace(f.Fact)
+		if factText == "" {
+			continue
+		}
+		cat := strings.TrimSpace(f.Category)
+		if cat == "" {
+			cat = "fact"
+		}
+		// Skip if already represented in pinned items
+		isPinned := false
+		for _, p := range pinnedItems {
+			if strings.EqualFold(strings.TrimSpace(p.Content), factText) {
+				isPinned = true
+				break
+			}
+		}
+		if isPinned {
+			continue
+		}
+		newItems = append(newItems, MemoryItem{
+			ID:        shortID("mem"),
+			Category:  cat,
+			Content:   factText,
+			CreatedAt: time.Now().Format("2006-01-02T15:04:05"),
+			Source:    fmt.Sprintf("auto:%s", sessionID),
+			Pinned:    false,
+		})
+		if len(pinnedItems)+len(newItems) >= 25 {
+			break
+		}
+	}
+
+	consolidated := append(pinnedItems, newItems...)
+	saveMemories(consolidated)
+	fmt.Printf("%s \033[35m[MEMORY]\033[0m Consolidated memory bank: %d total items (%d pinned, %d dynamic)\n",
+		time.Now().Format("15:04:05"), len(consolidated), len(pinnedItems), len(newItems))
 }

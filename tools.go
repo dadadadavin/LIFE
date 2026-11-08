@@ -310,7 +310,56 @@ func cleanHTMLText(raw string) string {
 	return strings.TrimSpace(s)
 }
 
+// truncateToolOutput recursively guards string values in tool execution outputs,
+// capping strings to maxChars (default 8,000 chars ~ 2,000 tokens) to prevent context blowout
+// in Gemini Live while preserving internal binary payloads (_native_screen_b64).
+func truncateToolOutput(m map[string]any, maxChars int) map[string]any {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		if k == "_native_screen_b64" {
+			out[k] = v
+			continue
+		}
+		out[k] = truncateToolValue(v, maxChars)
+	}
+	return out
+}
+
+func truncateToolValue(v any, maxChars int) any {
+	switch val := v.(type) {
+	case string:
+		if len(val) > maxChars {
+			return val[:maxChars] + fmt.Sprintf("\n... [Output truncated from %d to %d characters to preserve Gemini Live context window]", len(val), maxChars)
+		}
+		return val
+	case map[string]any:
+		return truncateToolOutput(val, maxChars)
+	case []any:
+		res := make([]any, len(val))
+		for i, elem := range val {
+			res[i] = truncateToolValue(elem, maxChars)
+		}
+		return res
+	case []map[string]any:
+		res := make([]map[string]any, len(val))
+		for i, elem := range val {
+			res[i] = truncateToolOutput(elem, maxChars)
+		}
+		return res
+	default:
+		return v
+	}
+}
+
 func executeLocalTool(name string, args map[string]any) map[string]any {
+	raw := runLocalTool(name, args)
+	return truncateToolOutput(raw, 8000)
+}
+
+func runLocalTool(name string, args map[string]any) map[string]any {
 	strArg := func(k string) string {
 		if v, ok := args[k]; ok && v != nil {
 			return strings.TrimSpace(fmt.Sprintf("%v", v))
