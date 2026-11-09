@@ -388,6 +388,8 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 		for {
 			_, rawMsg, err := conn.ReadMessage()
 			if err != nil {
+				fmt.Printf("%s \033[34m[WS CLIENT CLOSED]\033[0m Browser connection closed (%v)\n",
+					time.Now().Format("15:04:05"), err)
 				return
 			}
 			var msg map[string]any
@@ -488,6 +490,11 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 			case "ping":
 				_ = safeSend(map[string]any{"type": "pong", "ts": msg["ts"]})
 
+			case "barge_in":
+				rmsVal, _ := msg["rms"]
+				fmt.Printf("%s \033[33m[CLIENT BARGE-IN]\033[0m User interrupted speaker playback (RMS: %v)\n",
+					time.Now().Format("15:04:05"), rmsVal)
+
 			case "warm_rotate":
 				logMu.Lock()
 				sawGoAway = true
@@ -495,6 +502,8 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 				return
 
 			case "disconnect":
+				fmt.Printf("%s \033[34m[WS CLIENT DISCONNECT]\033[0m Client requested clean session disconnect\n",
+					time.Now().Format("15:04:05"))
 				return
 			}
 		}
@@ -703,7 +712,14 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 							if turnFirstByteLatencyMs == 0 && !lastUserActivity.IsZero() {
 								turnFirstByteLatencyMs = time.Since(lastUserActivity).Milliseconds()
 							}
+							firstAudioChunk := !modelSpeaking
+							modelSpeaking = true
 							turnMu.Unlock()
+
+							if firstAudioChunk {
+								fmt.Printf("%s \033[32m[AUDIO STREAMING]\033[0m Streaming Gemini spoken response (%s)...\n",
+									time.Now().Format("15:04:05"), cfg.VoiceName)
+							}
 
 							b64Audio := base64.StdEncoding.EncodeToString(part.InlineData.Data)
 							_ = safeSend(map[string]any{
@@ -738,7 +754,7 @@ func handleLiveWebSocket(w http.ResponseWriter, r *http.Request) {
 					turnMu.Unlock()
 
 					if flushedModel != "" {
-						fmt.Printf("%s \033[33m[INTERRUPTED]\033[0m Gemini speech interrupted: \"%s\"\n",
+						fmt.Printf("%s \033[33m[SERVER INTERRUPTED]\033[0m Google VAD interrupted speech: \"%s\"\n",
 							time.Now().Format("15:04:05"), flushedModel)
 						logMu.Lock()
 						turnsLog = append(turnsLog, TurnEntry{

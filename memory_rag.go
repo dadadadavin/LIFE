@@ -606,12 +606,14 @@ Strictly return valid JSON conforming to this schema:
 	}
 
 	models := []string{
-		"gemini-3.8-flash",
-		"gemini-3.7-flash",
-		"gemini-3.6-flash",
-		"gemini-3.5-flash-lite",
+		"gemini-3.5-flash-lite", // Primary: fast & verified working in ~3s
+		"gemini-3.6-flash",      // Secondary: verified working
 		"gemini-flash-lite-latest",
 	}
+
+	tStart := time.Now()
+	fmt.Printf("%s \033[35m[RAG CRUD]\033[0m Starting memory consolidation for %d turns (Session: %s)...\n",
+		tStart.Format("15:04:05"), len(batch), sessionID)
 
 	var rawJSON string
 	var successfulModel string
@@ -635,7 +637,9 @@ KeyLoop:
 				if attempt > 0 {
 					time.Sleep(time.Duration(attempt) * 750 * time.Millisecond)
 				}
-				reqCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				fmt.Printf("%s \033[35m[RAG CRUD]\033[0m Calling %s via key %s (attempt %d/2)...\n",
+					time.Now().Format("15:04:05"), modelName, k.Name, attempt+1)
+				reqCtx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 				temp := float32(0.1)
 				resp, err := client.Models.GenerateContent(reqCtx, modelName, []*genai.Content{
 					{
@@ -654,8 +658,8 @@ KeyLoop:
 						rawJSON = text
 						successfulModel = modelName
 						successfulKey = k.Name
-						fmt.Printf("%s \033[32m[RAG CRUD CONTROLLER]\033[0m Memory batch distilled via %s (Key: %s)\n",
-							time.Now().Format("15:04:05"), modelName, k.Name)
+						fmt.Printf("%s \033[32m[RAG CRUD SUCCESS]\033[0m Distilled %d turns in %v via %s (Key: %s)\n",
+							time.Now().Format("15:04:05"), len(batch), time.Since(tStart).Truncate(10*time.Millisecond), modelName, k.Name)
 						break KeyLoop
 					}
 				}
@@ -665,6 +669,8 @@ KeyLoop:
 				if err != nil {
 					errStr = err.Error()
 				}
+				fmt.Printf("%s \033[33m[RAG CRUD ATTEMPT FAILED]\033[0m %s via %s: %s\n",
+					time.Now().Format("15:04:05"), modelName, k.Name, errStr)
 
 				if strings.Contains(errStr, "503") || strings.Contains(errStr, "overloaded") || strings.Contains(errStr, "UNAVAILABLE") {
 					break

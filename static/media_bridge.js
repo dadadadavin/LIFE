@@ -6,7 +6,7 @@
     echo_shield: true,
     voice_barge_in: true,
     noise_gate_rms: 0,
-    barge_in_threshold: 600,
+    barge_in_threshold: 2400,
     vision_resolution: 1080,
     mirror_camera: false,
     browser_echo_cancellation: true,
@@ -70,7 +70,7 @@
         if ($("sidebar-key-label")) $("sidebar-key-label").textContent = appConfig.selected_key || "AUTO";
         if ($("echo-shield-indicator")) {
           $("echo-shield-indicator").textContent = appConfig.echo_shield
-            ? `On (Barge-In > ${appConfig.barge_in_threshold || 600})`
+            ? `On (Barge-In > ${appConfig.barge_in_threshold || 2400})`
             : "Off";
         }
         if ($("vision-res-select") && appConfig.vision_resolution) {
@@ -373,24 +373,34 @@
       const spkActive = isSpeakerPlaying();
       const inCooldown = (performance.now() - lastSpeakerEndTime) < 220;
       const gateRms = Number(appConfig.noise_gate_rms ?? 0);
-      const bargeRms = Number(appConfig.barge_in_threshold ?? 600);
+      const bargeRms = Number(appConfig.barge_in_threshold ?? 2400);
 
       // Smart Echo Shield + Voice Barge-In (Active ONLY while speaker is playing or cooling down)
       if (appConfig.echo_shield && (spkActive || inCooldown)) {
         if (appConfig.voice_barge_in !== false && rms >= bargeRms) {
-          // User spoke while speaker was active -> INSTANT BARGE-IN!
-          stopAllPlayback();
-          bargeInHotFrames = 0;
+          bargeInHotFrames++;
+          if (bargeInHotFrames >= 3) {
+            // User sustained loud speech over speaker for ~384ms -> Genuine Barge-In!
+            stopAllPlayback();
+            bargeInHotFrames = 0;
 
-          // 1. Flush rolling pre-roll buffer so opening words ("Wait", "Can you", "1, 2") are preserved!
-          while (preRollBuffers.length > 0) {
-            sendPcmBuffer(preRollBuffers.shift(), false);
+            // 1. Flush rolling pre-roll buffer so opening words are preserved
+            while (preRollBuffers.length > 0) {
+              sendPcmBuffer(preRollBuffers.shift(), false);
+            }
+
+            // 2. Send current frame
+            sendPcmBuffer(ev.data, false);
+            updateMicMeter(rms, "Barge-In Triggered");
+
+            // 3. Notify server terminal of client-side barge-in
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: "barge_in", rms: rms }));
+            }
+            return;
           }
-
-          // 2. Send current frame
-          sendPcmBuffer(ev.data, false);
-          updateMicMeter(rms, "Barge-In Triggered");
-          return;
+        } else {
+          bargeInHotFrames = 0;
         }
 
         // Speaker is outputting and user is not speaking louder than bargeRms.

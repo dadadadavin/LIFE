@@ -123,11 +123,11 @@ func defaultConfig() AppConfig {
 		EchoShield:              true,
 		VoiceBargeIn:            true,
 		NoiseGateRms:            0,
-		BargeInThreshold:        600,
+		BargeInThreshold:        2400,
 		PushToTalk:              false,
 		SpeakerVolume:           100,
 		AutoReconnect:           true,
-		StartSensitivity:        "START_SENSITIVITY_HIGH",
+		StartSensitivity:        "START_SENSITIVITY_LOW",
 		EndSensitivity:          "END_SENSITIVITY_LOW",
 		PrefixPaddingMs:         300,
 		SilenceDurationMs:       800,
@@ -204,8 +204,11 @@ func loadConfig() AppConfig {
 		if cfg.VisionResolution == 0 {
 			cfg.VisionResolution = 1080
 		}
-		if cfg.BargeInThreshold == 0 {
-			cfg.BargeInThreshold = 600
+		if cfg.BargeInThreshold < 1800 {
+			cfg.BargeInThreshold = 2400
+		}
+		if cfg.StartSensitivity == "START_SENSITIVITY_HIGH" || cfg.StartSensitivity == "" {
+			cfg.StartSensitivity = "START_SENSITIVITY_LOW"
 		}
 		if cfg.TavilyAPIKey == "" {
 			cfg.TavilyAPIKey = os.Getenv("TAVILY_API_KEY")
